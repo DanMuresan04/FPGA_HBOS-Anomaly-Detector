@@ -1,0 +1,25 @@
+# Ignore build output directories
+/build/
+/export/
+
+# Ignore object files and dependent files
+*.o
+*.d
+
+# Ignore logs folder and log files
+/logs/
+*.log
+
+# Ignore lock files
+*.lock
+
+# Ignore binaries and bitstreams
+*.bin
+*.pdi
+
+# Ignore Vitis IDE specific data
+.vitisWorkspace.json
+_ide/
+
+# Ignore auto-generated Clang DB (contains absolute paths)
+compile_commands.json
