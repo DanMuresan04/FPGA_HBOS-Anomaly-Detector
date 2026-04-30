@@ -1,0 +1,3 @@
+relativeroot=/home/dan/HLS/VivadoProjects/licenta/training_engine
+original_argv=--mode hls --csim --config /home/dan/HLS/VivadoProjects/licenta/training_engine/hls_config.cfg --work_dir training_engine 
+
