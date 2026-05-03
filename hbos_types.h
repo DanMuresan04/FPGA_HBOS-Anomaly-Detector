@@ -33,6 +33,7 @@ struct sensor_packet_t {
     sensor_t data[NR_SENSORS];
     opcode_t opcode;
     bool tlast;
+    ap_uint<16> reserve;
 };
 
 #endif
