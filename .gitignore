@@ -1,0 +1,20 @@
+# This repository tracks curated sources only. Everything at the repo root is
+# ignored by default; only the source directories below are versioned. The
+# surrounding Vivado/HLS build workspaces, datasets, venvs, IDE state, and logs
+# are intentionally excluded.
+
+# Ignore everything at the root...
+/*
+
+# ...except the curated source tree and repo metadata.
+!/HLS/
+!/VHDL/
+!/software/
+!/.gitignore
+!/README.md
+
+# Safety net inside the tracked dirs.
+__pycache__/
+*.pyc
+*.pyo
+.venv/
