@@ -387,7 +387,7 @@ def test_load_csv_mixed_numeric_and_header():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def test_telemetry_parse():
-    """Telemetry from a completed TrainSession must parse all four fields."""
+    """Telemetry from a completed TrainSession must report the global threshold."""
     cancel = threading.Event()
     client = MockFpgaClient()
     session = TrainSession(client, _make_rows(20), lambda *a: None, cancel)
@@ -395,13 +395,10 @@ def test_telemetry_parse():
     assert ok, "TrainSession must succeed before testing telemetry"
     parsed = TrainSession.parse_telemetry(stream)
     assert "global_threshold" in parsed, f"missing global_threshold: {parsed}"
-    assert "delta_th"         in parsed
-    assert "total_rx_train"   in parsed
-    assert "total_rx_calib"   in parsed
     assert isinstance(parsed["global_threshold"], int)
-    assert len(parsed["delta_th"]) == 4
-    assert parsed["total_rx_train"] > 0
-    assert parsed["total_rx_calib"] > 0
+    # delta_th and rx counters were removed from the telemetry.
+    assert "delta_th" not in parsed
+    assert "total_rx_train" not in parsed
 
 
 def test_telemetry_parse_short_stream():
@@ -429,27 +426,17 @@ def test_parse_telemetry_threshold_le24():
 
 
 def test_parse_telemetry_all_fields():
-    """Build a hand-crafted 17-byte stream and verify all 4 decoded fields."""
+    """Build the 5-byte threshold frame and verify it decodes."""
     th = 5000           # 0x001388
-    dt = [10, 20, 30, 40]
-    train = 1234
-    calib = 5678
-
     stream = (
         [0xFE]
         + [th & 0xFF, (th >> 8) & 0xFF, (th >> 16) & 0xFF]
-        + dt
-        + list(struct.pack("<I", train))
-        + list(struct.pack("<I", calib))
         + [0xFF]
     )
-    assert len(stream) == 17
+    assert len(stream) == 5
 
     parsed = TrainSession.parse_telemetry(stream)
     assert parsed["global_threshold"] == th
-    assert parsed["delta_th"]         == dt
-    assert parsed["total_rx_train"]   == train
-    assert parsed["total_rx_calib"]   == calib
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -466,7 +453,7 @@ def test_train_session_completes():
 
     assert ok, f"TrainSession returned ok=False: {msg}"
     assert stream and stream[0] == 0xFE and stream[-1] == 0xFF, f"invalid stream: {stream}"
-    assert len(stream) == 17, f"expected 17 bytes, got {len(stream)}"
+    assert len(stream) == 5, f"expected 5-byte threshold frame, got {len(stream)}"
     assert len(progress) > 0, "no progress callbacks fired"
     fracs = [f for f, _ in progress]
     assert fracs == sorted(fracs), f"progress went backwards: {fracs}"
@@ -1174,7 +1161,7 @@ def test_hbos_engine_telemetry_length():
     eng.on_calibrate(0, [100, 200, 150, 175], is_clean=True)
     eng.on_dump()
     telem = eng.telemetry()
-    assert len(telem) == 17
+    assert len(telem) == 5          # threshold-only frame: 0xFE | th[23:0] | 0xFF
     assert telem[0] == 0xFE
     assert telem[-1] == 0xFF
 

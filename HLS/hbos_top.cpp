@@ -3,6 +3,13 @@ count_t d_hist[NR_SENSORS][NR_DELTA_BINS] = {0};
 count_t score_hist[2048] = {0};
 delta_addr_t delta_th[NR_SENSORS] = {0};
 
+// histogram_builder's forwarding cache, hoisted to file scope so OP_RESET can
+// clear it (function-local statics can't be reached from the reset handler).
+static bin_addr_t   hb_last_addr[NR_SENSORS]   = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
+static count_t      hb_last_val[NR_SENSORS]     = {0, 0, 0, 0};
+static delta_addr_t hb_last_d_addr[NR_SENSORS]  = {0xFF, 0xFF, 0xFF, 0xFF};
+static count_t      hb_last_d_val[NR_SENSORS]   = {0, 0, 0, 0};
+
 // Defaults match former compile-time constants; overwritten by OP_CONFIG packets.
 static weight_t sensor_weights[NR_SENSORS] = {50, 93, 58, 55};
 static spike_t  spike_penalty = 5632;
@@ -67,10 +74,12 @@ total_score_t engine_score(count_t hist[NR_SENSORS][NR_BINS], addr_packet_t &pkt
 
 void histogram_builder(count_t hist[NR_SENSORS][NR_BINS], addr_packet_t &pkt, bool is_clean) {
     #pragma HLS INLINE
-    static bin_addr_t last_addr[NR_SENSORS] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
-    static count_t    last_val[NR_SENSORS]  = {0, 0, 0, 0};
-    static delta_addr_t last_d_addr[NR_SENSORS] = {0xFF, 0xFF, 0xFF, 0xFF};
-    static count_t      last_d_val[NR_SENSORS]  = {0, 0, 0, 0};
+    // Forwarding cache now lives at file scope (hb_last_*) so OP_RESET can clear
+    // it; aliased here to keep the body unchanged.
+    bin_addr_t   (&last_addr)[NR_SENSORS]   = hb_last_addr;
+    count_t      (&last_val)[NR_SENSORS]    = hb_last_val;
+    delta_addr_t (&last_d_addr)[NR_SENSORS] = hb_last_d_addr;
+    count_t      (&last_d_val)[NR_SENSORS]  = hb_last_d_val;
 
     #pragma HLS dependence variable=hist type=inter direction=RAW dependent=false
     #pragma HLS dependence variable=hist type=intra direction=RAW dependent=false
@@ -116,6 +125,10 @@ void hbos_top(hls::stream<addr_packet_t>& in_stream, count_t hist[NR_SENSORS][NR
     #pragma HLS BIND_STORAGE variable=d_hist type=ram_2p
     #pragma HLS ARRAY_PARTITION variable=delta_th complete dim=1
     #pragma HLS ARRAY_PARTITION variable=sensor_weights complete dim=1
+    #pragma HLS ARRAY_PARTITION variable=hb_last_addr   complete dim=1
+    #pragma HLS ARRAY_PARTITION variable=hb_last_val     complete dim=1
+    #pragma HLS ARRAY_PARTITION variable=hb_last_d_addr  complete dim=1
+    #pragma HLS ARRAY_PARTITION variable=hb_last_d_val   complete dim=1
 
     static count_t train_count = 0;
     static count_t calib_count = 0;
@@ -177,7 +190,51 @@ void hbos_top(hls::stream<addr_packet_t>& in_stream, count_t hist[NR_SENSORS][NR
         opcode_t opcode = pkt.opcode;
         bool is_clean = (pkt.tlast == 0);
 
-        if (opcode == OP_CONFIG) {
+        if (opcode == OP_RESET) {
+            // Full flush — zero every accumulator so the next TRAIN starts clean.
+            // Runs here in the slow (non-streaming) branch where multi-cycle
+            // loops are fine; sel_train='1' for OP_RESET so this core owns the
+            // hist BRAM write port. detection_engine resets its own state in
+            // parallel from the same broadcast packet.
+            for (int j = 0; j < NR_BINS; j++) {
+                #pragma HLS PIPELINE II=1
+                for (int i = 0; i < NR_SENSORS; i++) {
+                    #pragma HLS UNROLL
+                    hist[i][j] = 0;
+                }
+            }
+            for (int j = 0; j < NR_DELTA_BINS; j++) {
+                #pragma HLS PIPELINE II=1
+                for (int i = 0; i < NR_SENSORS; i++) {
+                    #pragma HLS UNROLL
+                    d_hist[i][j] = 0;
+                }
+            }
+            for (int j = 0; j < 2048; j++) {
+                #pragma HLS PIPELINE II=1
+                score_hist[j] = 0;
+            }
+            for (int i = 0; i < NR_SENSORS; i++) {
+                #pragma HLS UNROLL
+                delta_th[i]       = 0;
+                hb_last_addr[i]   = 0xFFFF;
+                hb_last_val[i]    = 0;
+                hb_last_d_addr[i] = 0xFF;
+                hb_last_d_val[i]  = 0;
+            }
+            train_count      = 0;
+            calib_count      = 0;
+            calib_done       = false;
+            hist_converted   = false;
+            config_written   = false;
+            total_rx_train   = 0;
+            total_rx_calib   = 0;
+            global_threshold = 32767;
+#ifndef __SYNTHESIS__
+            printf("[OP_RESET] full state flush\n");
+#endif
+        }
+        else if (opcode == OP_CONFIG) {
             // Latch weights and spike penalty encoded by address_engine into addr/d_addr.
             for (int i = 0; i < NR_SENSORS; i++) {
                 #pragma HLS UNROLL

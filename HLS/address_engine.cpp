@@ -28,7 +28,20 @@ void address_engine(
     out.tlast  = pkt.tlast;
     out.frame_ok = pkt.frame_ok;
 
-    if (pkt.opcode == OP_CONFIG) {
+    if (pkt.opcode == OP_RESET) {
+        // Full flush: forget the learned center and the delta history so the
+        // next TRAIN re-initialises from its first sample (initialized[]=false
+        // makes the next data packet reload center[]/prev_val[]).
+        for (int i = 0; i < NR_SENSORS; i++) {
+            #pragma HLS UNROLL
+            center[i]      = 0;
+            prev_val[i]    = 0;
+            initialized[i] = false;
+            out.addr[i]    = 0;
+            out.d_addr[i]  = 0;
+        }
+        last_opcode_ae = OP_RESET;
+    } else if (pkt.opcode == OP_CONFIG) {
         // Encode config payload into addr/d_addr for hbos_top to latch.
         // Packet layout (bytes):  [0]=w[0] [1]=w[1] [2]=w[2] [3]=w[3]
         //                         [4..5]=spike_penalty LE  [6..15]=padding

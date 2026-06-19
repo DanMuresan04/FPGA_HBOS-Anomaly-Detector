@@ -195,6 +195,13 @@ class StreamViewer(tk.Tk):
         self._state  = IDLE
         self._client: FpgaClient | None = None
         self._cancel = threading.Event()
+        # Live background threads, tracked so close/rerun can wait them out
+        # instead of tearing down Tk/serial underneath them (which triggers
+        # "Tcl_AsyncDelete: async handler deleted by the wrong thread").
+        self._worker_thread: "threading.Thread | None" = None
+        self._tx_thread:     "threading.Thread | None" = None
+        self._comp_thread:   "threading.Thread | None" = None
+        self._comp_gen = 0   # bumped each run; stale comparison results are ignored
         self._pq: queue.Queue = queue.Queue()
         self._comp_q: queue.Queue = queue.Queue()
 
@@ -240,6 +247,16 @@ class StreamViewer(tk.Tk):
         self._set_state(IDLE)
         self.configure(bg=self._bg)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Tkinter objects may only be finalized on the main (mainloop) thread.
+        # Python's cyclic GC can otherwise run on a background worker (e.g. the
+        # sklearn comparison thread allocating heavily) and finalize leftover
+        # Tk/matplotlib objects there, calling Tcl from the wrong thread ->
+        # "Tcl_AsyncDelete: async handler deleted by the wrong thread" / SIGABRT.
+        # Disable automatic GC (ref-counted frees still happen immediately) and
+        # run cyclic collection only here, on the main thread, via a timer.
+        gc.disable()
+        self.after(2000, self._gc_tick)
         # Auto-detect sensors from the default CSV if present
         _default = self._train_var.get()
         if _default and os.path.exists(_default):
@@ -260,11 +277,12 @@ class StreamViewer(tk.Tk):
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
 
         self._btn_train  = ttk.Button(top, text="Train",  command=self._on_train,  width=9)
+        self._btn_reset  = ttk.Button(top, text="Reset",  command=self._on_reset,  width=9)
         self._btn_cancel = ttk.Button(top, text="Cancel", command=self._on_cancel, width=9)
         self._btn_start  = ttk.Button(top, text="▶  Start", command=self._on_start, width=11)
         self._btn_stop   = ttk.Button(top, text="■  Stop",  command=self._on_stop,  width=11)
 
-        for b in (self._btn_train, self._btn_cancel):
+        for b in (self._btn_train, self._btn_reset, self._btn_cancel):
             b.pack(side=tk.LEFT, padx=3)
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
         for b in (self._btn_start, self._btn_stop):
@@ -578,6 +596,7 @@ class StreamViewer(tk.Tk):
         self._state = s
         self._lamp.set_state(s)
         self._btn_train.config( state=tk.NORMAL if s in (IDLE, READY, ERROR) else tk.DISABLED)
+        self._btn_reset.config( state=tk.NORMAL if s in (IDLE, READY, ERROR) else tk.DISABLED)
         self._btn_start.config( state=tk.NORMAL if s == READY               else tk.DISABLED)
         self._btn_stop.config(  state=tk.NORMAL if s == STREAMING           else tk.DISABLED)
         self._btn_cancel.config(state=tk.NORMAL if s == BUSY                else tk.DISABLED)
@@ -677,6 +696,43 @@ class StreamViewer(tk.Tk):
         threading.Thread(target=self._train_worker, args=(session,), daemon=True).start()
         self.after(PROGRESS_POLL_MS, self._poll_train_queue)
 
+    # ── Reset / flush ──────────────────────────────────────────────────────────
+
+    def _on_reset(self):
+        """Send a standalone OP_RESET to flush all FPGA engine state. Leaves the
+        device untrained (state → IDLE), so a Train is required afterwards."""
+        if self._state not in (IDLE, READY, ERROR):
+            return
+        if self._mock:
+            from .mock_client import MockFpgaClient
+            if self._client is None:
+                self._client = MockFpgaClient(nr_sensors=max(1, len(self._active_indices)))
+        elif self._client is None:
+            try:
+                self._client = FpgaClient(port=self._port_var.get(),
+                                          baud=int(self._baud_var.get()))
+            except Exception as exc:
+                messagebox.showerror("Serial port error", str(exc))
+                return
+
+        self._cancel.clear()
+        self._set_state(BUSY)
+        self._lamp.set_custom("FLUSHING", _ORANGE)
+        self._progress["mode"]  = "determinate"
+        self._progress["value"] = 0
+        self._status_var.set("Flushing FPGA state (OP_RESET)…")
+        threading.Thread(target=self._reset_worker, daemon=True).start()
+        self.after(PROGRESS_POLL_MS, self._poll_train_queue)
+
+    def _reset_worker(self):
+        try:
+            self._client.send_reset()
+            time.sleep(0.05)
+            self._client.drain(0.2)
+            self._pq.put(("reset_done", "FPGA state flushed — train to use."))
+        except Exception as exc:
+            self._pq.put(("done", False, None, f"Reset failed: {exc}", "reset"))
+
     def _train_progress_cb(self, frac: float, msg: str):
         self._pq.put(("progress", frac, msg))
 
@@ -697,6 +753,11 @@ class StreamViewer(tk.Tk):
                     _, frac, msg = item
                     self._progress["value"] = int(frac * 1000)
                     self._status_var.set(msg)
+                elif item[0] == "reset_done":
+                    self._progress["value"] = 0
+                    self._status_var.set(item[1])
+                    self._set_state(IDLE)
+                    return
                 elif item[0] == "done":
                     ok, stream, msg = item[1], item[2], item[3]
                     tag = item[4] if len(item) > 4 else "train"
@@ -704,11 +765,7 @@ class StreamViewer(tk.Tk):
                         parsed = TrainSession.parse_telemetry(stream)
                         detail = ""
                         if parsed:
-                            detail = (
-                                f"  th={parsed.get('global_threshold','?')}  "
-                                f"train_rx={parsed.get('total_rx_train','?')}  "
-                                f"calib_rx={parsed.get('total_rx_calib','?')}"
-                            )
+                            detail = f"  global threshold = {parsed.get('global_threshold','?')}"
                         self._progress["value"] = 1000
                         prefix = "FPGA ready." if tag == "train" else "Config applied."
                         self._status_var.set(f"{prefix}{detail}")
@@ -811,6 +868,12 @@ class StreamViewer(tk.Tk):
         for stat in (self._st_sample, self._st_reply, self._st_rtt, self._st_anom):
             stat.set("—")
 
+        # A previous fast run's worker/tx may still be draining; cancel and let
+        # them exit before reusing the serial port to avoid interleaved traffic.
+        self._cancel.set()
+        self._join_stream_threads(timeout=1.0)
+
+        self._comp_gen += 1   # invalidate any in-flight comparison from a prior run
         self._cancel.clear()
         self._set_state(STREAMING)
         self._progress["mode"]  = "determinate"
@@ -819,8 +882,17 @@ class StreamViewer(tk.Tk):
         self._stream_burst = self._burst_var.get()
         self._last_rtt     = 0
         self._stream_q     = queue.Queue()
-        threading.Thread(target=self._stream_worker, daemon=True).start()
+        self._worker_thread = threading.Thread(target=self._stream_worker, daemon=True)
+        self._worker_thread.start()
         self.after(PROGRESS_POLL_MS, self._poll_stream_queue)
+
+    def _join_stream_threads(self, timeout: float = 1.0):
+        """Wait briefly for the stream worker + tx threads to exit. Used before
+        reusing the serial port (rerun) or tearing down Tk (close)."""
+        deadline = time.monotonic() + timeout
+        for t in (self._tx_thread, self._worker_thread):
+            if t is not None and t.is_alive():
+                t.join(max(0.0, deadline - time.monotonic()))
 
     # ── streaming loop ────────────────────────────────────────────────────────
 
@@ -925,6 +997,7 @@ class StreamViewer(tk.Tk):
                 tlast = 1 if csv_list[pos] else 0
                 self._client.send_sample(vals_list[pos], OP_DETECT, tlast)
         tx_thread = threading.Thread(target=_tx, daemon=True)
+        self._tx_thread = tx_thread
         tx_thread.start()
 
         # RX: drain reply bytes in chunks, one verdict per detect, in order.
@@ -1042,12 +1115,18 @@ class StreamViewer(tk.Tk):
             self._show_error(msg)
 
         # Launch comparison in a background thread; poll results via main-thread queue.
+        # With the pipelined path the stream finishes near-instantly, so the
+        # (slower) sklearn comparison is usually still running when the user
+        # flips to tab 3 — show an explicit progress message, not the idle
+        # placeholder, so it doesn't look like nothing happened.
         if self._hbos_predictions and self._test_labels:
-            self._show_comparison_pending()
-            threading.Thread(
-                target=self._comparison_worker,
+            self._show_comparison_computing()
+            gen = self._comp_gen
+            self._comp_thread = threading.Thread(
+                target=lambda: self._comparison_worker(gen),
                 daemon=True,
-            ).start()
+            )
+            self._comp_thread.start()
             self.after(200, self._poll_comp_queue)
 
     # ── Stop ─────────────────────────────────────────────────────────────────
@@ -1242,7 +1321,23 @@ class StreamViewer(tk.Tk):
             justify=tk.CENTER,
         ).pack(expand=True, pady=60)
 
-    def _comparison_worker(self):
+    def _show_comparison_computing(self):
+        """Clear the comparison panel and show a 'computing' message while the
+        sklearn comparison runs in the background."""
+        for w in self._comp_inner.winfo_children():
+            w.destroy()
+        tk.Label(
+            self._comp_inner,
+            text="Computing comparison…\n(training CPU HBOS, Isolation Forest, One-Class SVM)",
+            bg=_BG, fg=_DIM, font=("Helvetica", 11), justify=tk.CENTER,
+        ).pack(expand=True, pady=60)
+
+    def _comparison_worker(self, gen: int):
+        import sys
+        t0 = time.monotonic()
+        print(f"[comp] start gen={gen} preds={len(self._hbos_predictions)} "
+              f"train={len(self._train_rows_cache)} test={len(self._stream_rows)}",
+              file=sys.stderr, flush=True)
         try:
             results = run_comparison(
                 self._train_rows_cache,
@@ -1253,11 +1348,20 @@ class StreamViewer(tk.Tk):
             import traceback
             traceback.print_exc()
             results = {"error": str(exc)}
-        self._comp_q.put(results)  # thread-safe: no tkinter call from background thread
+        print(f"[comp] done gen={gen} in {time.monotonic()-t0:.2f}s "
+              f"keys={list(results)}", file=sys.stderr, flush=True)
+        # Tag with the run generation so a stale result from a superseded run
+        # (rapid rerun) is discarded instead of overwriting the current panel.
+        self._comp_q.put((gen, results))  # thread-safe: no tkinter call here
 
     def _poll_comp_queue(self):
         try:
-            results = self._comp_q.get_nowait()
+            gen, results = self._comp_q.get_nowait()
+            import sys
+            print(f"[comp] deliver gen={gen} cur_gen={self._comp_gen} page={self._page}",
+                  file=sys.stderr, flush=True)
+            if gen != self._comp_gen:
+                return  # stale result from a superseded run; drop it
             self._comp_results = results
             if self._page == 2:
                 self._render_comparison(results)
@@ -1588,12 +1692,28 @@ class StreamViewer(tk.Tk):
 
     # ── cleanup ───────────────────────────────────────────────────────────────
 
+    def _gc_tick(self):
+        # Main-thread cyclic GC: reclaims Tk/matplotlib reference cycles safely
+        # (off-thread finalization is what aborts the process). Reschedules
+        # itself; cheap because little cyclic garbage accumulates between ticks.
+        gc.collect()
+        self.after(2000, self._gc_tick)
+
     def _on_close(self):
+        # HARD-EXIT, and do NOT call self.destroy()/plt.close first. Tk teardown
+        # while a daemon thread (the sklearn comparison, or stream tx/rx) is
+        # still alive panics with "Tcl_AsyncDelete: async handler deleted by the
+        # wrong thread" and SIGABRTs before we could exit. os._exit() is a direct
+        # _exit(2) syscall: it terminates immediately with no Python finalizers
+        # and no Tcl teardown, so the OS just reaps the process and closes the
+        # window — clean regardless of what the background threads are doing.
         self._cancel.set()
-        if self._client:
-            self._client.close()
-        plt.close("all")
-        self.destroy()
+        try:
+            if self._client:
+                self._client.close()
+        except Exception:
+            pass
+        os._exit(0)
 
 
 def main():

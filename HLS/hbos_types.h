@@ -30,6 +30,10 @@ typedef ap_uint<16> spike_t;
 #define OP_DETECT 2
 #define OP_DUMP   3
 #define OP_CONFIG 4
+// Explicit full-state flush. Sent by the host before (re)training so every
+// engine zeroes its accumulators/caches; without it a second TRAIN accumulates
+// onto the previous run's converted score histogram. opcode_t is 3 bits (0-7).
+#define OP_RESET  5
 
 #define FRAME_MAGIC_LO 0xA5
 #define FRAME_MAGIC_HI 0x5A

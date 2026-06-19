@@ -54,6 +54,7 @@ OP_CALIBRATE = 1
 OP_DETECT    = 2
 OP_DUMP      = 3
 OP_CONFIG    = 4
+OP_RESET     = 5
 
 RESULT_NAMES = {
     0x00: "normal",
@@ -153,6 +154,11 @@ class UartFpgaClient:
         padded = list(values) + [0.0, 0.0, 0.0, 0.0]
         self.send(self.pack_packet(padded[0], padded[1], padded[2], padded[3], opcode, tlast))
 
+    def send_reset(self) -> None:
+        """Send an OP_RESET frame: flushes all engine state on the FPGA so the
+        next training run starts from a clean slate."""
+        self.send(self.pack_packet(0, 0, 0, 0, OP_RESET, 0))
+
     def recv(self, timeout: float = 1.0) -> tuple:
         """Block until a 2-byte reply arrives or timeout expires.
         Returns (result_byte, raw_bytes) or (None, None).
@@ -211,10 +217,13 @@ class UartFpgaClient:
     # -- cleanup --------------------------------------------------------------
 
     def close(self) -> None:
-        try:
-            self._ser.close()
-        except Exception:
-            pass
+        # Hold the lock so we don't close the port out from under a concurrent
+        # send/read on the TX or RX thread.
+        with self._lock:
+            try:
+                self._ser.close()
+            except Exception:
+                pass
 
 
 # -- smoke test ---------------------------------------------------------------

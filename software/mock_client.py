@@ -18,7 +18,7 @@ import struct
 import threading
 import time
 
-from .uart_client import OP_TRAIN, OP_CALIBRATE, OP_DETECT, OP_DUMP, OP_CONFIG
+from .uart_client import OP_TRAIN, OP_CALIBRATE, OP_DETECT, OP_DUMP, OP_CONFIG, OP_RESET
 
 NR_BINS       = 2048
 NR_DELTA_BINS = 256
@@ -101,6 +101,11 @@ class _HbosEngine:
 
         self._train_history = None
         self._det_history   = None
+
+    def reset(self):
+        """Full flush — mirror the FPGA OP_RESET: clear model and go idle."""
+        self._reset_model()
+        self._state = self._IDLE
 
     # ── packet processing ─────────────────────────────────────────────────────
 
@@ -211,17 +216,12 @@ class _HbosEngine:
         return total
 
     def telemetry(self) -> list:
+        # Threshold-only readback: 0xFE | global_threshold[23:0] LE | 0xFF.
+        # Mirrors the FPGA after the telemetry FSM was reduced to the threshold.
         th = self._global_th
-        tc = self._train_count & 0xFFFFFFFF
-        cc = self._calib_count & 0xFFFFFFFF
-        # Keep 4-byte delta_th field for parse_telemetry compatibility
-        dth = (self._delta_th + [255, 255, 255, 255])[:4]
         return [
             0xFE,
             th & 0xFF, (th >> 8) & 0xFF, (th >> 16) & 0xFF,
-            dth[0], dth[1], dth[2], dth[3],
-            tc & 0xFF, (tc >> 8) & 0xFF, (tc >> 16) & 0xFF, (tc >> 24) & 0xFF,
-            cc & 0xFF, (cc >> 8) & 0xFF, (cc >> 16) & 0xFF, (cc >> 24) & 0xFF,
             0xFF,
         ]
 
@@ -275,6 +275,12 @@ class MockFpgaClient:
         opcode = payload[16]
         tlast  = payload[17]
 
+        if opcode == OP_RESET:
+            self._hbos.reset()
+            self._calib_idx   = 0
+            self._last_opcode = opcode
+            return
+
         if opcode == OP_CONFIG:
             w_raw   = struct.unpack('<I', payload[0:4])[0]
             spike   = struct.unpack('<i', payload[4:8])[0] & 0xFFFF
@@ -317,11 +323,21 @@ class MockFpgaClient:
             self._detect_data = [struct.unpack('<i', payload[4*s:4*s+4])[0] for s in range(4)]
             self._last_opcode = opcode
 
+    def send_reset(self) -> None:
+        """Flush the mock engine — mirrors UartFpgaClient.send_reset / OP_RESET."""
+        self._hbos.reset()
+        self._calib_idx   = 0
+        self._last_opcode = OP_RESET
+
     def send_sample(self, values: list, opcode: int, tlast: int) -> None:
         """Send N sensor values directly to the HBOS engine, bypassing serialisation."""
         data = [int(float(v)) for v in values]
         is_clean = (tlast == 0)
-        if opcode == OP_TRAIN:
+        if opcode == OP_RESET:
+            self._hbos.reset()
+            self._calib_idx   = 0
+            self._last_opcode = opcode
+        elif opcode == OP_TRAIN:
             self._hbos.on_train(data, is_clean)
             self._last_opcode = opcode
         elif opcode == OP_CALIBRATE:

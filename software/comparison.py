@@ -181,7 +181,11 @@ def run_comparison(
         max_samples=min(512, len(X_tr_s)),
         contamination=contamination,
         random_state=42,
-        n_jobs=-1,
+        # n_jobs=1 (not -1): joblib's subprocess worker pool can stall when
+        # spawned from the GUI's background thread in a detached session, which
+        # left the comparison stuck on "Computing…". Single-threaded fit is
+        # still sub-second here.
+        n_jobs=1,
     )
     iforest.fit(X_tr_s)
     fit_ms_if = int((time.perf_counter() - t0) * 1000)

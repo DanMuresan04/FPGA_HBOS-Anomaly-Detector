@@ -17,7 +17,7 @@ import time
 import threading
 from typing import Callable
 
-from .uart_client import UartFpgaClient as FpgaClient, OP_TRAIN, OP_CALIBRATE, OP_DUMP, OP_CONFIG
+from .uart_client import UartFpgaClient as FpgaClient, OP_TRAIN, OP_CALIBRATE, OP_DUMP, OP_CONFIG, OP_RESET
 
 TRAIN_PACE       = 0.0002   # seconds between send()s during train/calib
 POST_CALIB_WAIT  = 5.0      # seconds to wait after last CALIB before latch
@@ -72,6 +72,14 @@ class TrainSession:
             ok=True means the FPGA is in the ready state.
         """
         n = len(self._rows)
+
+        # ── 0a. RESET ────────────────────────────────────────────────────────
+        # Flush all FPGA engine state so this run never accumulates onto the
+        # previous training's histograms. Sent before CONFIG/TRAIN.
+        self._cb(0.00, "Flushing FPGA state (OP_RESET)…")
+        self._c.send_reset()
+        time.sleep(0.05)
+        self._c.drain(0.2)
 
         # ── 0. CONFIG (optional) ─────────────────────────────────────────────
         if self._weights is not None:
@@ -226,15 +234,15 @@ class TrainSession:
     @staticmethod
     def parse_telemetry(stream: list) -> dict:
         """
-        Decode the 17-byte telemetry stream into a human-readable dict.
+        Decode the 5-byte threshold readback into a dict.
 
         Stream layout (one byte per OP_DUMP poll):
           [0]    0xFE  banner
           [1-3]  global_threshold  LE24
-          [4-7]  delta_th[0..3]
-          [8-11] total_rx_train    LE32
-          [12-15] total_rx_calib   LE32
-          [16]   0xFF  terminator
+          [4]    0xFF  terminator
+
+        (delta_th and the rx counters were removed from the FPGA telemetry —
+        only the final global threshold is reported now.)
         """
         if not stream or stream[0] != 0xFE:
             return {}
@@ -242,21 +250,5 @@ class TrainSession:
         if len(stream) >= 4:
             result["global_threshold"] = (
                 stream[1] | (stream[2] << 8) | (stream[3] << 16)
-            )
-        if len(stream) >= 8:
-            result["delta_th"] = stream[4:8]
-        if len(stream) >= 12:
-            result["total_rx_train"] = (
-                stream[8]
-                | (stream[9] << 8)
-                | (stream[10] << 16)
-                | (stream[11] << 24)
-            )
-        if len(stream) >= 16:
-            result["total_rx_calib"] = (
-                stream[12]
-                | (stream[13] << 8)
-                | (stream[14] << 16)
-                | (stream[15] << 24)
             )
         return result
