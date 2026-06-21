@@ -103,45 +103,31 @@ class UartFpgaClient:
 
     # -- packet building ------------------------------------------------------
 
+    def pack_frame(self, values: list, active_count: int, opcode: int, tlast: int) -> bytes:
+        """Count-prefixed variable frame (matches packet_assembler.cpp):
+          [n_words][active_count][opcode][tlast][ n_words LE int32 ][0xA5][0x5A]
+        n_words = len(values); the assembler waits for exactly that many ints."""
+        vals = list(values)
+        n = len(vals)
+        out = bytes((n & 0xFF, int(active_count) & 0xFF, opcode & 0x07, tlast & 1))
+        for v in vals:
+            out += struct.pack("<i", int(float(v)))
+        return out + bytes((0xA5, 0x5A))
+
     def pack_config_packet(self, weights: list, spike_penalty: int,
-                           sensor_mask=None) -> bytes:
-        """Pack a 20-byte OP_CONFIG payload encoding sensor weights, spike penalty,
-        and an optional sensor enable mask.
-
-        HLS layout (address_engine.cpp):
-          pkt.data[0] LE bytes: [w0, w1, w2, w3]
-          pkt.data[1] LE16:     spike_penalty
-          pkt.data[2] low nibble: sensor_mask (bit i = sensor i enabled)
-        """
-        w = [int(weights[i]) & 0xFF for i in range(4)]
-        w_unsigned = w[0] | (w[1] << 8) | (w[2] << 16) | (w[3] << 24)
-        s0 = struct.unpack('<i', struct.pack('<I', w_unsigned))[0]
-        if sensor_mask is None:
-            mask_bits = 0xF
-        elif isinstance(sensor_mask, (list, tuple)):
-            mask_bits = sum((1 << i) for i, v in enumerate(sensor_mask) if v) & 0xF
-        else:
-            mask_bits = int(sensor_mask) & 0xF
-        return self.pack_packet(s0, int(spike_penalty) & 0xFFFF, mask_bits, 0, OP_CONFIG, 0)
-
-    def pack_packet(
-        self,
-        s0: int,
-        s1: int,
-        s2: int,
-        s3: int,
-        opcode: int,
-        tlast: int,
-    ) -> bytes:
-        """Build a 20-byte UART TX payload."""
-        return (
-            struct.pack(
-                "<iiiiBB",
-                int(float(s0)), int(float(s1)), int(float(s2)), int(float(s3)),
-                opcode, tlast,
-            )
-            + bytes((0xA5, 0x5A))
-        )
+                           active_count: int = None) -> bytes:
+        """OP_CONFIG frame: 16 weights packed LE into 4 int32 words + spike as a
+        5th word.  `weights` = active-channel weights in order (channel 0..N-1)."""
+        w = [int(x) & 0xFF for x in list(weights)[:16]]
+        w += [0] * (16 - len(w))
+        if active_count is None:
+            active_count = len(list(weights))
+        words = []
+        for k in range(4):
+            val = w[4*k] | (w[4*k+1] << 8) | (w[4*k+2] << 16) | (w[4*k+3] << 24)
+            words.append(struct.unpack('<i', struct.pack('<I', val))[0])
+        words.append(int(spike_penalty) & 0xFFFF)   # data[4] = spike_penalty
+        return self.pack_frame(words, active_count, OP_CONFIG, 0)
 
     # -- send / recv ----------------------------------------------------------
 
@@ -150,14 +136,18 @@ class UartFpgaClient:
             self._ser.write(payload)
 
     def send_sample(self, values: list, opcode: int, tlast: int) -> None:
-        """Send a sample, truncating/padding sensor values to 4 slots for UART."""
-        padded = list(values) + [0.0, 0.0, 0.0, 0.0]
-        self.send(self.pack_packet(padded[0], padded[1], padded[2], padded[3], opcode, tlast))
+        """Send one frame carrying exactly the active sensor values; the engine
+        reads active_count = len(values) and gates the calc on the first N units."""
+        vals = list(values)
+        self.send(self.pack_frame(vals, len(vals), opcode, tlast))
+
+    def send_control(self, opcode: int, active_count: int = 0) -> None:
+        """Send a data-less control frame (RESET / DUMP / CALIB pump)."""
+        self.send(self.pack_frame([], active_count, opcode, 0))
 
     def send_reset(self) -> None:
-        """Send an OP_RESET frame: flushes all engine state on the FPGA so the
-        next training run starts from a clean slate."""
-        self.send(self.pack_packet(0, 0, 0, 0, OP_RESET, 0))
+        """OP_RESET: flush all engine state so the next training run starts clean."""
+        self.send_control(OP_RESET)
 
     def recv(self, timeout: float = 1.0) -> tuple:
         """Block until a 2-byte reply arrives or timeout expires.
@@ -253,7 +243,7 @@ if __name__ == "__main__":
     client = UartFpgaClient(port=port, baud=args.baud)
     print(f"Opened {port} @ {args.baud} baud")
 
-    pkt = client.pack_packet(s0=100, s1=200, s2=300, s3=400, opcode=args.op, tlast=1)
+    pkt = client.pack_frame([100, 200, 300, 400], 4, args.op, 1)
     print(f"TX {len(pkt)} bytes: {pkt.hex()}")
     client.send(pkt)
 

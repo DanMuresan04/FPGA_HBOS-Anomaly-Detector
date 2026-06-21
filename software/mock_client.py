@@ -244,36 +244,36 @@ class MockFpgaClient:
 
     # ── packet building ───────────────────────────────────────────────────────
 
-    def pack_config_packet(self, weights: list, spike_penalty: int,
-                           sensor_mask=None) -> bytes:
-        w = [int(weights[i]) & 0xFF for i in range(4)]
-        w_unsigned = w[0] | (w[1] << 8) | (w[2] << 16) | (w[3] << 24)
-        s0 = struct.unpack('<i', struct.pack('<I', w_unsigned))[0]
-        if sensor_mask is None:
-            mask_bits = 0xF
-        elif isinstance(sensor_mask, (list, tuple)):
-            mask_bits = sum((1 << i) for i, v in enumerate(sensor_mask) if v) & 0xF
-        else:
-            mask_bits = int(sensor_mask) & 0xF
-        return self.pack_packet(s0, int(spike_penalty) & 0xFFFF, mask_bits, 0, OP_CONFIG, 0)
+    def pack_frame(self, values: list, active_count: int, opcode: int, tlast: int) -> bytes:
+        vals = list(values)
+        out = bytes((len(vals) & 0xFF, int(active_count) & 0xFF, opcode & 0x07, tlast & 1))
+        for v in vals:
+            out += struct.pack("<i", int(float(v)))
+        return out + bytes((0xA5, 0x5A))
 
-    def pack_packet(self, s0, s1, s2, s3, opcode: int, tlast: int) -> bytes:
-        return (
-            struct.pack(
-                "<iiiiBB",
-                int(float(s0)), int(float(s1)), int(float(s2)), int(float(s3)),
-                opcode, tlast,
-            )
-            + bytes((0xA5, 0x5A))
-        )
+    def pack_config_packet(self, weights: list, spike_penalty: int,
+                           active_count: int = None) -> bytes:
+        w = [int(x) & 0xFF for x in list(weights)[:16]]
+        w += [0] * (16 - len(w))
+        if active_count is None:
+            active_count = len(list(weights))
+        words = []
+        for k in range(4):
+            val = w[4*k] | (w[4*k+1] << 8) | (w[4*k+2] << 16) | (w[4*k+3] << 24)
+            words.append(struct.unpack('<i', struct.pack('<I', val))[0])
+        words.append(int(spike_penalty) & 0xFFFF)
+        return self.pack_frame(words, active_count, OP_CONFIG, 0)
 
     # ── send ──────────────────────────────────────────────────────────────────
 
     def send(self, payload: bytes) -> None:
-        if len(payload) < 18:
+        # New count-prefixed frame: [n_words][active_count][opcode][tlast][data..][magic]
+        if len(payload) < 6:
             return
-        opcode = payload[16]
-        tlast  = payload[17]
+        n_words = payload[0]
+        opcode  = payload[2] & 0x07
+        tlast   = payload[3] & 1
+        words = [struct.unpack('<i', payload[4 + 4*i:8 + 4*i])[0] for i in range(n_words)]
 
         if opcode == OP_RESET:
             self._hbos.reset()
@@ -282,24 +282,25 @@ class MockFpgaClient:
             return
 
         if opcode == OP_CONFIG:
-            w_raw   = struct.unpack('<I', payload[0:4])[0]
-            spike   = struct.unpack('<i', payload[4:8])[0] & 0xFFFF
-            weights = [(w_raw >> (8 * i)) & 0xFF for i in range(4)]
-            self._hbos.set_config(weights, spike)
-            # All sensor slots active in mock — selection handled by _active_indices in GUI
-            self._hbos.set_mask((1 << self._hbos._nr_sensors) - 1)
+            # words = [w0..3 packed, spike]; 16 weights, first nr_sensors are live.
+            ns = self._hbos._nr_sensors
+            w16 = []
+            for k in range(4):
+                wv = words[k] & 0xFFFFFFFF
+                w16 += [(wv >> (8*b)) & 0xFF for b in range(4)]
+            spike = words[4] & 0xFFFF if len(words) > 4 else 0
+            self._hbos.set_config(w16[:ns], spike)
+            self._hbos.set_mask((1 << ns) - 1)
             self._last_opcode = opcode
             return
 
         if opcode == OP_TRAIN:
-            data = [struct.unpack('<i', payload[4*s:4*s+4])[0] for s in range(4)]
-            self._hbos.on_train(data, is_clean=(tlast == 0))
+            self._hbos.on_train(words, is_clean=(tlast == 0))
             self._last_opcode = opcode
             return
 
         if opcode == OP_CALIBRATE:
-            data = [struct.unpack('<i', payload[4*s:4*s+4])[0] for s in range(4)]
-            self._hbos.on_calibrate(self._calib_idx, data, is_clean=(tlast == 0))
+            self._hbos.on_calibrate(self._calib_idx, words, is_clean=(tlast == 0))
             self._calib_idx += 1
             self._last_opcode = opcode
             return
@@ -320,7 +321,7 @@ class MockFpgaClient:
 
         if opcode == OP_DETECT:
             self._detect_pending = True
-            self._detect_data = [struct.unpack('<i', payload[4*s:4*s+4])[0] for s in range(4)]
+            self._detect_data = words
             self._last_opcode = opcode
 
     def send_reset(self) -> None:

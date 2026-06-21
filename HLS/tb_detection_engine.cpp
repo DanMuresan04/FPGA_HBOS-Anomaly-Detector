@@ -40,8 +40,6 @@ int main() {
         err = 1;
     }
 
-    // 6 config words matching hbos_top's OP_DUMP output:
-    // [0]=threshold [1]=packed_deltas [2]=rx_train [3]=rx_calib [4]=packed_weights [5]=spike_penalty
     config_in.write((ap_uint<32>)2288);
     config_in.write((ap_uint<32>)((105) | (165 << 8) | (144 << 16) | (87 << 24)));
     config_in.write((ap_uint<32>)1000);
@@ -49,7 +47,6 @@ int main() {
     config_in.write((ap_uint<32>)((50) | (93 << 8) | (58 << 16) | (55 << 24)));
     config_in.write((ap_uint<32>)5632);
 
-    // OP_DUMP reads word 0 (cfg_rx_cnt: 0→1), sets dump_ack_pending.
     write_addr(in, OP_DUMP, true);
     detection_engine(in, config_in, hist, anomaly_out);
     if (!anomaly_out.empty()) {
@@ -57,7 +54,6 @@ int main() {
         err = 1;
     }
 
-    // 4 pump calls read words 1-4 (cfg_rx_cnt: 1→5); no latch yet.
     for (int d = 0; d < 4; d++) {
         write_addr(in, OP_CALIB, true);
         detection_engine(in, config_in, hist, anomaly_out);
@@ -67,7 +63,6 @@ int main() {
         }
     }
 
-    // Final pump reads word 5 (cfg_rx_cnt==5): latches config and writes 0xFF ack.
     write_addr(in, OP_CALIB, true);
     detection_engine(in, config_in, hist, anomaly_out);
     if (anomaly_out.empty()) {
@@ -92,9 +87,6 @@ int main() {
         printf("PASS: DETECT reply 0x%02X\n", (int)anomaly_out.read().data);
     }
 
-    // ── retrain: OP_TRAIN must disable inference ──────────────────────────────
-    // After OP_TRAIN arrives, inference_enabled must be false so that OP_DETECT
-    // produces no output until a new config is latched (DUMP→CALIB pump).
     write_addr(in, OP_TRAIN, true);
     detection_engine(in, config_in, hist, anomaly_out);
     if (!anomaly_out.empty()) {

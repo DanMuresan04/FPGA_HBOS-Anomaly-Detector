@@ -57,8 +57,20 @@ class TrainSession:
         self._cancel = cancel_event
         self._weights = weights
         self._spike_penalty = spike_penalty if spike_penalty is not None else 5632
-        self._sensor_mask = sensor_mask        # list of 4 bools; None = all enabled
-        self._active_cols = active_sensor_cols  # CSV col index per packet slot (len=4)
+        self._sensor_mask = sensor_mask        # list of bools; None = all enabled
+        self._active_cols = active_sensor_cols  # CSV col index per active channel (len=N)
+
+    def _ac(self) -> int:
+        """Active sensor count (= number of live channels)."""
+        if self._active_cols:
+            return len(self._active_cols)
+        return len(self._weights) if self._weights else 4
+
+    def _active_weights(self) -> list:
+        """Weights repacked to channel order 0..N-1, matching the packed data."""
+        w = self._weights or []
+        cols = self._active_cols if self._active_cols else list(range(len(w)))
+        return [int(w[c]) if c < len(w) else 0 for c in cols]
 
     # ── public ───────────────────────────────────────────────────────────────
 
@@ -85,7 +97,7 @@ class TrainSession:
         if self._weights is not None:
             self._cb(0.00, "Sending OP_CONFIG…")
             self._c.send(self._c.pack_config_packet(
-                self._weights, self._spike_penalty, self._sensor_mask))
+                self._active_weights(), self._spike_penalty, self._ac()))
             time.sleep(0.05)
 
         # ── 1. TRAIN ────────────────────────────────────────────────────────
@@ -107,12 +119,12 @@ class TrainSession:
 
         # ── 4. Config latch ──────────────────────────────────────────────────
         self._cb(0.78, f"Config latch: 1× DUMP + {DUMP_CALIB_LATCH}× CALIB pump…")
-        self._c.send(self._c.pack_packet(0, 0, 0, 0, OP_DUMP, 0))
+        self._c.send(self._c.pack_frame([], self._ac(), OP_DUMP, 0))
         time.sleep(0.1)
         for _ in range(DUMP_CALIB_LATCH):
             if self._cancel.is_set():
                 return False, None, "Cancelled during config latch"
-            self._c.send(self._c.pack_packet(0, 0, 0, 0, OP_CALIBRATE, 0))
+            self._c.send(self._c.pack_frame([], self._ac(), OP_CALIBRATE, 0))
             time.sleep(0.02)
         self._cb(0.84, f"Latch settle ({LATCH_SETTLE:.0f}s)…")
         if not self._wait(LATCH_SETTLE):
@@ -161,7 +173,7 @@ class TrainSession:
         for poll in range(TELEMETRY_POLLS):
             if self._cancel.is_set():
                 return False, stream
-            c.send(c.pack_packet(0, 0, 0, 0, OP_DUMP, 0))
+            c.send(c.pack_frame([], self._ac(), OP_DUMP, 0))
             time.sleep(POLL_GAP)
             byte_val, _ = c.recv(timeout=0.35)
             if byte_val is None:
@@ -203,16 +215,16 @@ class TrainSession:
         c = self._c
 
         self._cb(0.05, "Sending OP_CONFIG…")
-        c.send(c.pack_config_packet(self._weights, self._spike_penalty, self._sensor_mask))
+        c.send(c.pack_config_packet(self._active_weights(), self._spike_penalty, self._ac()))
         time.sleep(0.05)
 
         self._cb(0.20, f"Config latch: 1× DUMP + {DUMP_CALIB_LATCH}× CALIB…")
-        c.send(c.pack_packet(0, 0, 0, 0, OP_DUMP, 0))
+        c.send(c.pack_frame([], self._ac(), OP_DUMP, 0))
         time.sleep(0.1)
         for _ in range(DUMP_CALIB_LATCH):
             if self._cancel.is_set():
                 return False, None, "Cancelled during config latch"
-            c.send(c.pack_packet(0, 0, 0, 0, OP_CALIBRATE, 0))
+            c.send(c.pack_frame([], self._ac(), OP_CALIBRATE, 0))
             time.sleep(0.02)
 
         self._cb(0.70, f"Latch settle ({LATCH_SETTLE:.0f}s)…")

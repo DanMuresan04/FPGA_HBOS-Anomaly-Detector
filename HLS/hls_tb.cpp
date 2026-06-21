@@ -30,7 +30,6 @@ static void serialize_packet(sensor_packet_t &pkt, ap_uint<8> buffer[20]) {
     buffer[19] = FRAME_MAGIC_HI;
 }
 
-
 static void pipeline_one_packet(
     hls::stream<rx_byte_axis_t>& rx_byte_stream,
     count_t hist[NR_SENSORS][NR_BINS],
@@ -75,16 +74,14 @@ int main() {
     printf("Starting Training Engine C-Simulation...\n");
     printf("Both hbos_top and detection_engine receive every packet (broadcaster model).\n\n");
 
-    // --- OP_CONFIG: set weights and spike_penalty before any training data ---
-    // Packet layout: bytes[0..3] = weights[0..3], bytes[4..5] = spike_penalty LE
     {
         ap_uint<8> cfg_buf[20] = {0};
-        cfg_buf[0] = 50;   // weight sensor 0
-        cfg_buf[1] = 93;   // weight sensor 1
-        cfg_buf[2] = 58;   // weight sensor 2
-        cfg_buf[3] = 55;   // weight sensor 3
-        cfg_buf[4] = (ap_uint<8>)(5632 & 0xFF);   // spike_penalty low byte
-        cfg_buf[5] = (ap_uint<8>)((5632 >> 8) & 0xFF); // spike_penalty high byte
+        cfg_buf[0] = 50;
+        cfg_buf[1] = 93;
+        cfg_buf[2] = 58;
+        cfg_buf[3] = 55;
+        cfg_buf[4] = (ap_uint<8>)(5632 & 0xFF);
+        cfg_buf[5] = (ap_uint<8>)((5632 >> 8) & 0xFF);
         cfg_buf[16] = OP_CONFIG;
         cfg_buf[17] = 0;
         cfg_buf[18] = FRAME_MAGIC_LO;
@@ -92,7 +89,6 @@ int main() {
         pipeline_one_packet(rx_byte_stream, hist, config_fifo, anomaly_out, cfg_buf);
         printf("OP_CONFIG delivered.\n\n");
     }
-
 
     for (int pass = 0; pass < 2; pass++) {
         const char *name = (pass == 0) ? "TRAINING" : "CALIBRATION";
@@ -123,7 +119,6 @@ int main() {
         printf("  Processed %d samples\n", count);
     }
 
-
     printf("\n--- PASS 2: OP_DUMP ---\n");
 
     sensor_packet_t dump_pkt;
@@ -145,9 +140,7 @@ int main() {
 
     ap_uint<8> trigger_buffer[20];
     serialize_packet(trigger_pkt, trigger_buffer);
-    // Drain all 6 config words from config_fifo: detection_engine reads one word per
-    // invocation via read_nb.  OP_DUMP already read word 0; 5 more packets drain words 1-5.
-    // On the 6th word (cfg_rx_cnt == 5), detection_engine latches config and writes 0xFF.
+
     printf("  Draining 5 config words (5x OP_CALIB)...\n");
     for (int d = 0; d < 5; d++) {
         pipeline_one_packet(rx_byte_stream, hist, config_fifo, anomaly_out, trigger_buffer);
@@ -166,7 +159,6 @@ int main() {
         printf(" [UNEXPECTED]\n");
         return 1;
     }
-
 
     printf("\n--- PASS 3: OP_DETECT ---\n");
     file.clear();
