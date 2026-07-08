@@ -14,12 +14,12 @@
 #       ./run_pkg.sh hbos_top 1          # force TDM/shared
 #   --deploy (optional) after packaging, clears $IP_REPO/<top>/ and unzips the
 #   fresh IP into it (replaces the by-hand copy+unzip). IP_REPO defaults to
-#   /home/dan/HLS/IP_REPOSITORY.
+#   $HOME/HLS/IP_REPOSITORY.
 #       ./run_pkg.sh all 4 --deploy      # rebuild + deploy all 3 at K=4 (board-consistent)
 #       ./run_pkg.sh hbos_top 1 --deploy
 #
 # Requires vitis-run/v++ on PATH, or set VITIS_BIN, or source:
-#   source /home/dan/Vivado/2025.2/Vitis/settings64.sh
+#   source "$HOME/Vivado/2025.2/Vitis/settings64.sh"
 set -euo pipefail
 cd "$(dirname "$0")"
 SRC="$(pwd)"
@@ -28,7 +28,7 @@ SRC="$(pwd)"
 # source the bash Vitis settings itself — the caller doesn't need to (and from
 # fish, can't) source settings64.sh. Skip if v++ is already on PATH.
 if ! command -v v++ >/dev/null 2>&1; then
-  VITIS_SETTINGS="${VITIS_SETTINGS:-/home/dan/Vivado/2025.2/Vitis/settings64.sh}"
+  VITIS_SETTINGS="${VITIS_SETTINGS:-$HOME/Vivado/2025.2/Vitis/settings64.sh}"
   # settings64.sh references unset vars (e.g. PYTHONPATH); relax nounset around it.
   if [[ -f "$VITIS_SETTINGS" ]]; then
     set +u; source "$VITIS_SETTINGS"; set -u
@@ -57,8 +57,8 @@ find_vitis_bin() {
 
 VBIN="$(find_vitis_bin)" || {
   echo "ERROR: vitis-run/v++ not found." >&2
-  echo "  source /home/dan/Vivado/2025.2/Vitis/settings64.sh" >&2
-  echo "  or: export VITIS_BIN=/home/dan/Vivado/2025.2/Vitis/bin" >&2
+  echo "  source \"$HOME/Vivado/2025.2/Vitis/settings64.sh\"" >&2
+  echo "  or: export VITIS_BIN=\"$HOME/Vivado/2025.2/Vitis/bin\"" >&2
   exit 127
 }
 
@@ -73,7 +73,7 @@ for arg in "$@"; do
     *) K="$arg" ;;
   esac
 done
-IP_REPO="${IP_REPO:-/home/dan/HLS/IP_REPOSITORY}"
+IP_REPO="${IP_REPO:-$HOME/HLS/IP_REPOSITORY}"
 
 # The three kernels whose RTL is parameterised by K_PARALLEL. packet_assembler
 # is intentionally NOT here: it has no per-sensor K loop, so K never changes it.
@@ -93,14 +93,19 @@ build_one() {
     detection_engine) FILES=(hbos_types.h hbos_math.h hbos_top.h detection_engine.cpp) ;;
     hbos_top)         FILES=(hbos_types.h hbos_math.h hbos_top.h hbos_top.cpp) ;;
     hbos_engine)      FILES=(hbos_types.h hbos_math.h hbos_engine.h hbos_engine.cpp) ;;
+    dataset_dma)      FILES=(hbos_types.h dataset_dma.cpp) ;;
+    udp_tx_packetizer) FILES=(hbos_types.h udp_tx_packetizer.cpp) ;;
     *) echo "unknown top: $TOP" >&2; return 1 ;;
   esac
 
   local WORK="$SRC/${TOP}_ip"
-  local CFG; CFG="$(mktemp /tmp/pkg_${TOP}_XXXXXX.cfg)"
+  # Keep the generated cfg INSIDE the work dir (not /tmp) so the packaged HLS
+  # component opens in the Vitis IDE with its sources linked — a /tmp cfg gets
+  # deleted, which leaves the IDE component's Sources tree empty.
+  rm -rf "$WORK"; mkdir -p "$WORK"
+  local PART="xc7a100tcsg324-1"
+  local CFG="$WORK/hls_build.cfg"
   {
-    echo "part=xc7a100tcsg324-1"
-    echo ""
     echo "[hls]"
     echo "flow_target=vivado"
     echo "package.output.format=ip_catalog"
@@ -114,11 +119,9 @@ build_one() {
     local f; for f in "${FILES[@]}"; do echo "syn.file=$SRC/$f"; done
   } >"$CFG"
 
-  rm -rf "$WORK"
   echo "=== SYNTH + PACKAGE  top=$TOP  K=${K:-<default>}  work=$WORK ==="
-  "$VBIN/v++" -c --mode hls --config "$CFG" --work_dir "$WORK"
-  "$VBIN/vitis-run" --mode hls --package --config "$CFG" --work_dir "$WORK"
-  rm -f "$CFG"
+  "$VBIN/v++" -c --mode hls --part "$PART" --config "$CFG" --work_dir "$WORK"
+  "$VBIN/vitis-run" --mode hls --package --part "$PART" --config "$CFG" --work_dir "$WORK"
   echo "=== DONE: IP packaged for top=$TOP -> $WORK ==="
 
   if [[ "$DEPLOY" == "1" ]]; then

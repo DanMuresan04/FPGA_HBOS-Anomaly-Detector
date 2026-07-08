@@ -3,7 +3,8 @@
 
 int main() {
     hls::stream<sensor_packet_t> in;
-    hls::stream<addr_packet_t> out;
+    hls::stream<addr_ctrl_t>     ctrl;
+    hls::stream<addr_data_t>     data;
 
     sensor_packet_t pkt = {};
     pkt.data[0] = 1000;
@@ -15,14 +16,15 @@ int main() {
     pkt.frame_ok = true;
     in.write(pkt);
 
-    address_engine(in, out);
-    addr_packet_t a = out.read();
+    address_engine(in, ctrl, data);
+    addr_ctrl_t c = ctrl.read();
+    addr_data_t d = data.read();
 
-    if (!a.frame_ok) {
+    if (!c.frame_ok) {
         printf("FAIL: frame_ok not passed through\n");
         return 1;
     }
     printf("PASS: frame_ok=1 addrs=%d,%d,%d,%d\n",
-           (int)a.addr[0], (int)a.addr[1], (int)a.addr[2], (int)a.addr[3]);
+           (int)d.addr[0], (int)d.addr[1], (int)d.addr[2], (int)d.addr[3]);
     return 0;
 }

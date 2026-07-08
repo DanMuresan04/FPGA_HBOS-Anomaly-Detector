@@ -24,7 +24,7 @@ import struct
 import threading
 import time
 
-DEFAULT_BAUD = 1_000_000
+DEFAULT_BAUD = 1_000_000   # 100 MHz / 100 clks-per-bit; exact FT2232H rate (12 MHz / 12)
 
 
 def find_nexys_uart_port() -> "str | None":
@@ -49,12 +49,20 @@ else:
     DEFAULT_PORT = find_nexys_uart_port() or "/dev/ttyUSB1"
 REPLY_BYTES  = 1
 
-OP_TRAIN     = 0
-OP_CALIBRATE = 1
-OP_DETECT    = 2
-OP_DUMP      = 3
-OP_CONFIG    = 4
-OP_RESET     = 5
+OP_TRAIN      = 0
+OP_CALIBRATE  = 1
+OP_DETECT     = 2
+OP_DUMP       = 3
+OP_CONFIG     = 4
+OP_RESET      = 5
+OP_LOAD_TRAIN = 6   # (DMA/DDR2) store frame into the DDR2 train region
+OP_LOAD_TEST  = 7   # (DMA/DDR2) store frame into the DDR2 test region
+
+# Calibration threshold knob: the global score threshold keeps a fraction
+# (1 - 2**-shift) of clean calib samples below it, i.e. the (1 - 2**-shift)
+# percentile. shift=9 -> 99.8th pct (the original hardcoded >> 9 behavior).
+# Lower shift -> lower threshold -> higher recall. Sent as OP_CONFIG data[6].
+DEFAULT_CALIB_SHIFT = 9
 
 RESULT_NAMES = {
     0x00: "normal",
@@ -103,21 +111,29 @@ class UartFpgaClient:
 
     # -- packet building ------------------------------------------------------
 
-    def pack_frame(self, values: list, active_count: int, opcode: int, tlast: int) -> bytes:
+    def pack_frame(self, values: list, active_count: int, opcode: int, tlast: int,
+                   seq: int = 0) -> bytes:
         """Count-prefixed variable frame (matches packet_assembler.cpp):
-          [n_words][active_count][opcode][tlast][ n_words LE int32 ][0xA5][0x5A]
-        n_words = len(values); the assembler waits for exactly that many ints."""
+          [n_words][active_count][opcode][tlast][seq:3 LE][ n_words LE int32 ][A5][5A]
+        seq is the sample id echoed back in the verdict so responses self-identify."""
         vals = list(values)
         n = len(vals)
-        out = bytes((n & 0xFF, int(active_count) & 0xFF, opcode & 0x07, tlast & 1))
+        s = int(seq) & 0xFFFFFF
+        out = bytes((n & 0xFF, int(active_count) & 0xFF, opcode & 0x0F, tlast & 1,
+                     s & 0xFF, (s >> 8) & 0xFF, (s >> 16) & 0xFF))
         for v in vals:
             out += struct.pack("<i", int(float(v)))
         return out + bytes((0xA5, 0x5A))
 
     def pack_config_packet(self, weights: list, spike_penalty: int,
-                           active_count: int = None) -> bytes:
+                           active_count: int = None, delta_stride: int = 1,
+                           calib_shift: int = DEFAULT_CALIB_SHIFT) -> bytes:
         """OP_CONFIG frame: 16 weights packed LE into 4 int32 words + spike as a
-        5th word.  `weights` = active-channel weights in order (channel 0..N-1)."""
+        5th word + delta stride as a 6th word + calib shift as a 7th word.
+        `weights` = active-channel weights in order (channel 0..N-1).
+        `delta_stride` (1..8) is applied on the FPGA only during detection (see
+        address_engine); 1 = immediate-previous delta.  `calib_shift` sets the
+        global-threshold percentile (1 - 2**-shift); 9 = the original 99.8th pct."""
         w = [int(x) & 0xFF for x in list(weights)[:16]]
         w += [0] * (16 - len(w))
         if active_count is None:
@@ -127,6 +143,8 @@ class UartFpgaClient:
             val = w[4*k] | (w[4*k+1] << 8) | (w[4*k+2] << 16) | (w[4*k+3] << 24)
             words.append(struct.unpack('<i', struct.pack('<I', val))[0])
         words.append(int(spike_penalty) & 0xFFFF)   # data[4] = spike_penalty
+        words.append(int(delta_stride) & 0xF)        # data[5] = detect delta stride
+        words.append(int(calib_shift) & 0x1F)        # data[6] = calib threshold shift
         return self.pack_frame(words, active_count, OP_CONFIG, 0)
 
     # -- send / recv ----------------------------------------------------------
@@ -135,11 +153,11 @@ class UartFpgaClient:
         with self._lock:
             self._ser.write(payload)
 
-    def send_sample(self, values: list, opcode: int, tlast: int) -> None:
+    def send_sample(self, values: list, opcode: int, tlast: int, seq: int = 0) -> None:
         """Send one frame carrying exactly the active sensor values; the engine
-        reads active_count = len(values) and gates the calc on the first N units."""
+        reads active_count = len(values) and echoes seq in the verdict."""
         vals = list(values)
-        self.send(self.pack_frame(vals, len(vals), opcode, tlast))
+        self.send(self.pack_frame(vals, len(vals), opcode, tlast, seq))
 
     def send_control(self, opcode: int, active_count: int = 0) -> None:
         """Send a data-less control frame (RESET / DUMP / CALIB pump)."""
@@ -169,6 +187,22 @@ class UartFpgaClient:
                 return None, None
             data = self._ser.read(REPLY_BYTES)
         return self.decode(data)["result"], data
+
+    VERDICT_BYTES = 4   # [seq:3 LE][verdict:1] detect response
+
+    def recv_verdict(self, timeout: float = 1.0):
+        """Read one 4-byte detect response and return (seq, verdict), else None.
+        seq is the sample id the engine echoed, so callers do results[seq]=verdict
+        regardless of arrival order or dropped responses."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self._ser.in_waiting >= self.VERDICT_BYTES:
+                    d = self._ser.read(self.VERDICT_BYTES)
+                    seq = d[0] | (d[1] << 8) | (d[2] << 16)
+                    return seq, d[3]
+            time.sleep(0.001)
+        return None
 
     def read_available(self) -> bytes:
         """Non-blocking bulk read: return all currently buffered RX bytes (one

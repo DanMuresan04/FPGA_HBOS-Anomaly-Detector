@@ -3,7 +3,7 @@
 # Usage: ./run_csim.sh packet_assembler|address_engine|hbos_top|detection_engine|full
 #
 # Requires vitis-run on PATH, or set VITIS_RUN, or source:
-#   source /home/dan/Vivado/2025.2/Vitis/settings64.sh
+#   source "$HOME/Vivado/2025.2/Vitis/settings64.sh"
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -34,8 +34,8 @@ find_vitis_run() {
 
 VITIS_RUN_BIN="$(find_vitis_run)" || {
   echo "ERROR: vitis-run not found." >&2
-  echo "  source /home/dan/Vivado/2025.2/Vitis/settings64.sh" >&2
-  echo "  or: export VITIS_RUN=/home/dan/Vivado/2025.2/Vitis/bin/vitis-run" >&2
+  echo "  source \"$HOME/Vivado/2025.2/Vitis/settings64.sh\"" >&2
+  echo "  or: export VITIS_RUN=\"$HOME/Vivado/2025.2/Vitis/bin/vitis-run\"" >&2
   exit 127
 }
 
@@ -46,6 +46,10 @@ COMMON=(
   syn.file=hbos_math.h
   syn.file=packet_assembler.cpp
   syn.file=address_engine.cpp
+  syn.file=hbos_engine.cpp
+  syn.file=hbos_engine.h
+  syn.file=dataset_dma.cpp
+  syn.file=udp_tx_packetizer.cpp
   syn.file=hbos_top.cpp
   syn.file=hbos_top.h
   syn.file=detection_engine.cpp
@@ -74,6 +78,61 @@ case "$TOP" in
     DISPLAY=training_engine
     TOP=hbos_top
     ;;
+  hbos_engine)
+    TB=tb_hbos_engine.cpp
+    EXTRA_TB=hls_test_stream.csv
+    DISPLAY=hbos_engine
+    ;;
+  stride)
+    TB=tb_stride.cpp
+    DISPLAY=address_engine
+    TOP=address_engine
+    ;;
+  stress)
+    TB=tb_stress.cpp
+    DISPLAY=hbos_engine
+    TOP=hbos_engine
+    ;;
+  retrain)
+    TB=tb_retrain.cpp
+    DISPLAY=hbos_engine
+    TOP=hbos_engine
+    ;;
+  label)
+    TB=tb_label.cpp
+    DISPLAY=hbos_engine
+    TOP=hbos_engine
+    ;;
+  packetizer)
+    TB=tb_packetizer.cpp
+    DISPLAY=udp_tx_packetizer
+    TOP=udp_tx_packetizer
+    ;;
+  dma_load)
+    TB=tb_dataset_dma.cpp
+    DISPLAY=dataset_dma
+    TOP=dataset_dma
+    ;;
+  dma_integration)
+    TB=tb_dma_integration.cpp
+    DISPLAY=hbos_engine
+    TOP=hbos_engine
+    ;;
+  dma_label)
+    TB=tb_dma_label.cpp
+    DISPLAY=hbos_engine
+    TOP=hbos_engine
+    ;;
+  reference)
+    TB=tb_reference.cpp
+    DISPLAY=hbos_engine
+    TOP=hbos_engine
+    ;;
+  replica)
+    TB=tb_replica.cpp
+    DISPLAY=hbos_engine
+    TOP=hbos_engine
+    ;;
   *)
     echo "unknown top: $TOP" >&2
     exit 1
@@ -92,6 +151,7 @@ trap 'rm -f "$CFG"' EXIT
   echo "package.output.syn=false"
   echo "clock=100Mhz"
   echo "tb.file=$TB"
+  if [[ -n "${EXTRA_TB:-}" ]]; then echo "tb.file=$EXTRA_TB"; fi
   echo "syn.top=$TOP"
   echo "package.ip.display_name=$DISPLAY"
   for f in "${COMMON[@]}"; do echo "$f"; done

@@ -31,7 +31,9 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-from .uart_client import UartFpgaClient as FpgaClient, OP_DETECT, find_nexys_uart_port, DEFAULT_PORT
+from .udp_client import (UdpFpgaClient as FpgaClient, OP_DETECT,
+                         OP_LOAD_TRAIN, OP_LOAD_TEST,
+                         FPGA_IP, LoadError)
 from .train_session import TrainSession
 from .comparison import run_comparison, _SKLEARN_OK
 
@@ -47,19 +49,65 @@ STREAM_RATE_HZ   = 5
 DETECT_TIMEOUT   = 1.0
 PROGRESS_POLL_MS = 80
 BURST_PLOT_EVERY = 50   # redraw interval in burst mode
+# Inter-frame gap (s) for burst TX. No longer needed: the BD now has RX/TX AXIS
+# FIFOs that absorb the board's emit stalls, and paced==burst confirmed there was
+# never an overrun. Kept as a knob (0 = full speed); raise only if a future,
+# slower board variant ever drops frames.
+BURST_TX_GAP_S   = 0.0
 PROGRESS_INTERVAL = 500  # rows between GUI progress updates (in train_session)
 
-DEFAULT_TRAIN_CSV = str(
-    Path(__file__).parent.parent / "datasets" / "training" / "datatraining_stripped.csv"
-)
-DEFAULT_TEST_DIR = str(
-    Path(__file__).parent.parent / "datasets" / "test"
-)
+_DATASETS_ROOT = Path(__file__).parent.parent / "datasets"
 
-DEFAULT_WEIGHTS = [14, 44, 159, 37]  # optimal weights
-DEFAULT_SPIKE   = 5632
+# Dataset registry. Each entry fully specifies how to run that dataset: train
+# file, test directory, detect-time delta stride, per-sensor weights, spike
+# penalty, and calibration percentile. Picking a dataset in the UI applies all
+# of these at once (see _apply_dataset) so there is nothing to remember per set.
+#
+#   water_quality  — the test file already has every 5th sample removed (those
+#                    are the training samples), so a stride of 4 reaches exactly
+#                    5 original samples back = the scale the histograms were
+#                    trained on. Using stride 5 here would overshoot (~6.25 back)
+#                    and collapse recall.
+#   room_occupancy — contiguous stream, immediate-previous delta (stride 1).
+DATASETS = {
+    "water_quality": {
+        "train":   str(_DATASETS_ROOT / "training" / "water_quality" / "water_quality_train.csv"),
+        "test":    str(_DATASETS_ROOT / "test" / "water_quality"),
+        "stride":  4,
+        "weights": [50, 93, 58, 55],
+        "spike":   5632,
+        "calib":   "99.8",
+    },
+    "room_occupancy": {
+        "train":   str(_DATASETS_ROOT / "training" / "room_occupancy" / "datatraining_stripped.csv"),
+        "test":    str(_DATASETS_ROOT / "test" / "room_occupancy"),
+        "stride":  1,
+        "weights": [14, 44, 159, 37],
+        "spike":   5632,
+        "calib":   "99.8",
+    },
+}
+DEFAULT_DATASET = "water_quality"
 
-NR_SENSORS_MAX = 16   # toggle strip capacity
+# Backward-compatible module constants, derived from the default dataset.
+DEFAULT_TRAIN_CSV = DATASETS[DEFAULT_DATASET]["train"]
+DEFAULT_TEST_DIR  = DATASETS[DEFAULT_DATASET]["test"]
+DEFAULT_WEIGHTS   = DATASETS[DEFAULT_DATASET]["weights"]
+DEFAULT_SPIKE     = DATASETS[DEFAULT_DATASET]["spike"]
+
+# Global-threshold percentile knob (OP_CONFIG data[6]). The calibration keeps a
+# fraction (1 - 2**-shift) of clean samples below threshold, i.e. that percentile.
+# Higher shift -> stricter threshold -> higher precision / lower recall.
+# Listed low->high so the spinbox arrows go up = stricter, down = more recall.
+_CALIB_LEVELS = [
+    (4,  "93.8"), (5,  "96.9"), (6,  "98.4"), (7,  "99.2"),
+    (8,  "99.6"), (9,  "99.8"), (10, "99.9"), (11, "99.95"),
+]
+_CALIB_PCT_TO_SHIFT = {pct: shift for shift, pct in _CALIB_LEVELS}
+_CALIB_PCT_VALUES   = [pct for _, pct in _CALIB_LEVELS]
+DEFAULT_CALIB_PCT   = "99.8"   # shift 9 — the original hardcoded behavior
+
+NR_SENSORS_MAX = 4    # toggle strip capacity — matches HLS NR_SENSORS (4-channel TDM build)
 NR_SLOTS       = 4    # algorithm slots (current HLS packet limit)
 
 SENSOR_LABELS = [f"s{i}" for i in range(NR_SENSORS_MAX)]
@@ -85,13 +133,15 @@ _RED      = "#f44747"
 # ── states ────────────────────────────────────────────────────────────────────
 IDLE      = "idle"
 BUSY      = "busy"
+LOADED    = "loaded"
 READY     = "ready"
 STREAMING = "streaming"
 ERROR     = "error"
 
 _LAMP_CFG = {
     IDLE:      ("#2e2e3e", "#4a4a6a", _DIM,    "NOT READY"),
-    BUSY:      ("#4a3700", "#c48a00", _ORANGE, "TRAINING"),
+    BUSY:      ("#4a3700", "#c48a00", _ORANGE, "WORKING"),
+    LOADED:    ("#0a3a4a", "#0a8ab0", "#4fc3f7", "DATA LOADED"),
     READY:     ("#1a4a1a", "#3aaa3a", _GREEN,  "READY"),
     STREAMING: ("#002244", "#0078cc", "#4fc3f7", "STREAMING"),
     ERROR:     ("#4a1a1a", "#cc3333", _RED,    "ERROR"),
@@ -193,6 +243,7 @@ class StreamViewer(tk.Tk):
         self._bg = ttk.Style().lookup("TFrame", "background") or _BG
 
         self._state  = IDLE
+        self._data_loaded = False   # True once a dataset is staged in DDR2
         self._client: FpgaClient | None = None
         self._cancel = threading.Event()
         # Live background threads, tracked so close/rerun can wait them out
@@ -227,10 +278,12 @@ class StreamViewer(tk.Tk):
         self._comp_results:     "dict | None" = None
 
         # Must be initialised before _build_ui() which binds these to Entry widgets.
-        self._port_var   = tk.StringVar(value=find_nexys_uart_port() or DEFAULT_PORT)
-        self._baud_var   = tk.StringVar(value="1000000")
+        self._ip_var     = tk.StringVar(value=FPGA_IP)
         self._weight_vars = [tk.IntVar(value=w) for w in DEFAULT_WEIGHTS]
         self._spike_var   = tk.IntVar(value=DEFAULT_SPIKE)
+        self._stride_var  = tk.IntVar(value=1)   # detect-time delta stride (1..8)
+        self._calib_var   = tk.StringVar(value=DEFAULT_CALIB_PCT)  # threshold percentile
+        self._dataset_var = tk.StringVar(value=DEFAULT_DATASET)    # dataset picker
         self._burst_var   = tk.BooleanVar(value=False)
         self._follow_var  = tk.BooleanVar(value=True)
         self._sensor_mask_vars = [tk.BooleanVar(value=False) for _ in range(NR_SENSORS_MAX)]
@@ -243,6 +296,10 @@ class StreamViewer(tk.Tk):
         self._train_hist_data: "list | None" = None
 
         self._build_ui()
+
+        # Fill train/test paths, stride, weights, spike and calib from the
+        # default dataset (must run after _build_ui creates the bound widgets).
+        self._apply_dataset(DEFAULT_DATASET)
 
         self._set_state(IDLE)
         self.configure(bg=self._bg)
@@ -276,13 +333,14 @@ class StreamViewer(tk.Tk):
 
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
 
+        self._btn_load   = ttk.Button(top, text="Load Data", command=self._on_load, width=10)
         self._btn_train  = ttk.Button(top, text="Train",  command=self._on_train,  width=9)
         self._btn_reset  = ttk.Button(top, text="Reset",  command=self._on_reset,  width=9)
         self._btn_cancel = ttk.Button(top, text="Cancel", command=self._on_cancel, width=9)
         self._btn_start  = ttk.Button(top, text="▶  Start", command=self._on_start, width=11)
         self._btn_stop   = ttk.Button(top, text="■  Stop",  command=self._on_stop,  width=11)
 
-        for b in (self._btn_train, self._btn_reset, self._btn_cancel):
+        for b in (self._btn_load, self._btn_train, self._btn_reset, self._btn_cancel):
             b.pack(side=tk.LEFT, padx=3)
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
         for b in (self._btn_start, self._btn_stop):
@@ -293,11 +351,27 @@ class StreamViewer(tk.Tk):
         ttk.Checkbutton(top, text="Follow", variable=self._follow_var,
                         command=self._on_follow_toggle).pack(side=tk.LEFT, padx=(6, 0))
 
+        # ── dataset picker ────────────────────────────────────────────────────
+        dsrow = ttk.Frame(self, padding=(12, 4, 12, 0))
+        dsrow.pack(fill=tk.X, side=tk.TOP)
+        ttk.Label(dsrow, text="Dataset", foreground=_DIM,
+                  font=("Helvetica", 8)).pack(side=tk.LEFT, padx=(0, 4))
+        self._dataset_combo = ttk.Combobox(
+            dsrow, textvariable=self._dataset_var, values=list(DATASETS.keys()),
+            state="readonly", width=18
+        )
+        self._dataset_combo.pack(side=tk.LEFT)
+        self._dataset_combo.bind(
+            "<<ComboboxSelected>>", lambda _e: self._on_dataset_change()
+        )
+        ttk.Label(dsrow, text="(sets train/test paths, stride, weights, spike, pctile)",
+                  foreground=_DIM, font=("Helvetica", 8)).pack(side=tk.LEFT, padx=(8, 0))
+
         # ── file row ──────────────────────────────────────────────────────────
         files = ttk.Frame(self, padding=(12, 4, 12, 8))
         files.pack(fill=tk.X, side=tk.TOP)
 
-        ttk.Label(files, text="Train CSV", foreground=_DIM,
+        ttk.Label(files, text="Train CSV / Dir", foreground=_DIM,
                   font=("Helvetica", 8)).grid(row=0, column=0, sticky=tk.W, padx=(0, 4))
         self._train_var = tk.StringVar(
             value=DEFAULT_TRAIN_CSV if os.path.exists(DEFAULT_TRAIN_CSV) else ""
@@ -320,12 +394,9 @@ class StreamViewer(tk.Tk):
         conn.pack(fill=tk.X, side=tk.TOP)
         self._conn_frame = conn
 
-        ttk.Label(conn, text="Port", foreground=_DIM,
+        ttk.Label(conn, text="FPGA IP", foreground=_DIM,
                   font=("Helvetica", 8)).pack(side=tk.LEFT, padx=(0, 2))
-        ttk.Entry(conn, textvariable=self._port_var, width=14).pack(side=tk.LEFT, padx=(0, 20))
-        ttk.Label(conn, text="Baud", foreground=_DIM,
-                  font=("Helvetica", 8)).pack(side=tk.LEFT, padx=(0, 2))
-        ttk.Entry(conn, textvariable=self._baud_var, width=10).pack(side=tk.LEFT)
+        ttk.Entry(conn, textvariable=self._ip_var, width=16).pack(side=tk.LEFT)
 
         # ── sensor weight config ───────────────────────────────────────────────
         wcfg = ttk.Frame(self, padding=(12, 0, 12, 6))
@@ -360,6 +431,18 @@ class StreamViewer(tk.Tk):
                   font=("Helvetica", 8)).pack(side=tk.LEFT, padx=(0, 2))
         ttk.Spinbox(wcfg, textvariable=self._spike_var, from_=0, to=65535,
                     width=6).pack(side=tk.LEFT, padx=(0, 14))
+
+        ttk.Label(wcfg, text="Δstride", foreground=_DIM,
+                  font=("Helvetica", 8)).pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Spinbox(wcfg, textvariable=self._stride_var, from_=1, to=8,
+                    width=3).pack(side=tk.LEFT, padx=(0, 14))
+
+        ttk.Label(wcfg, text="Thr pctile", foreground=_DIM,
+                  font=("Helvetica", 8)).pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Spinbox(wcfg, textvariable=self._calib_var, values=_CALIB_PCT_VALUES,
+                    state="readonly", width=5).pack(side=tk.LEFT, padx=(0, 1))
+        ttk.Label(wcfg, text="%", foreground=_DIM,
+                  font=("Helvetica", 8)).pack(side=tk.LEFT, padx=(0, 14))
 
         self._btn_apply = ttk.Button(wcfg, text="Apply Config",
                                      command=self._on_apply_config, width=12)
@@ -502,8 +585,30 @@ class StreamViewer(tk.Tk):
 
     # ── file pickers ─────────────────────────────────────────────────────────
 
+    def _on_dataset_change(self):
+        self._apply_dataset(self._dataset_var.get())
+
+    def _apply_dataset(self, name: str) -> None:
+        """Apply a registry dataset: fill train/test paths and every knob it
+        pins (stride, weights, spike, calib percentile), then re-detect the
+        sensor count from the new train CSV. Missing paths are left blank so the
+        user can browse rather than the field silently pointing at nothing."""
+        cfg = DATASETS.get(name)
+        if not cfg:
+            return
+        self._train_var.set(cfg["train"] if os.path.exists(cfg["train"]) else "")
+        self._test_var.set(cfg["test"] if os.path.isdir(cfg["test"]) else "")
+        self._stride_var.set(cfg["stride"])
+        for var, w in zip(self._weight_vars, cfg["weights"]):
+            var.set(w)
+        self._spike_var.set(cfg["spike"])
+        self._calib_var.set(cfg["calib"])
+        tp = self._train_var.get()
+        if tp and os.path.exists(tp):
+            self._detect_csv_sensors(tp)
+
     def _pick_train(self):
-        p = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("All", "*")])
+        p = filedialog.askdirectory(title="Select train CSV directory")
         if p:
             self._train_var.set(p)
             self._detect_csv_sensors(p)
@@ -518,6 +623,12 @@ class StreamViewer(tk.Tk):
     def _detect_csv_sensors(self, path: str) -> None:
         """Read the first data row of the CSV, count sensor columns (all but last),
         enable those toggle slots and grey out the rest."""
+        p = Path(path)
+        if p.is_dir():
+            csvs = sorted(p.glob("*.csv"))
+            if not csvs:
+                return
+            path = str(csvs[0])
         try:
             with open(path, newline="") as fh:
                 reader = csv.reader(fh)
@@ -595,12 +706,16 @@ class StreamViewer(tk.Tk):
     def _set_state(self, s: str):
         self._state = s
         self._lamp.set_state(s)
-        self._btn_train.config( state=tk.NORMAL if s in (IDLE, READY, ERROR) else tk.DISABLED)
-        self._btn_reset.config( state=tk.NORMAL if s in (IDLE, READY, ERROR) else tk.DISABLED)
-        self._btn_start.config( state=tk.NORMAL if s == READY               else tk.DISABLED)
-        self._btn_stop.config(  state=tk.NORMAL if s == STREAMING           else tk.DISABLED)
-        self._btn_cancel.config(state=tk.NORMAL if s == BUSY                else tk.DISABLED)
-        self._btn_apply.config( state=tk.NORMAL if s == READY               else tk.DISABLED)
+        idle_like = s in (IDLE, LOADED, READY, ERROR)
+        # Train is a DDR2 replay trigger: only meaningful once data is staged.
+        can_train = idle_like and self._data_loaded
+        self._btn_load.config(  state=tk.NORMAL if idle_like             else tk.DISABLED)
+        self._btn_train.config( state=tk.NORMAL if can_train             else tk.DISABLED)
+        self._btn_reset.config( state=tk.NORMAL if idle_like             else tk.DISABLED)
+        self._btn_start.config( state=tk.NORMAL if s == READY            else tk.DISABLED)
+        self._btn_stop.config(  state=tk.NORMAL if s == STREAMING        else tk.DISABLED)
+        self._btn_cancel.config(state=tk.NORMAL if s == BUSY             else tk.DISABLED)
+        self._btn_apply.config( state=tk.NORMAL if s == READY            else tk.DISABLED)
         self._refresh_sensor_toggles()
         if s != ERROR:
             self._dismiss_error()
@@ -621,26 +736,39 @@ class StreamViewer(tk.Tk):
 
     # ── Train ─────────────────────────────────────────────────────────────────
 
-    def _on_train(self):
+    # ── Load Data (stage both datasets into DDR2 once) ─────────────────────────
+
+    def _on_load(self):
+        """Stream the train + test CSVs into the FPGA's DDR2 exactly once
+        (OP_RESET then OP_LOAD_TRAIN / OP_LOAD_TEST). Train and Start afterwards
+        replay from DDR2 at engine clock instead of re-streaming over UART."""
+        if self._state not in (IDLE, LOADED, READY, ERROR):
+            return
+
         train_path = self._train_var.get().strip()
+        test_path  = self._test_var.get().strip()
         if not train_path or not os.path.exists(train_path):
-            messagebox.showerror("Train CSV missing", "Select a valid train CSV first.")
+            messagebox.showerror("Train data missing", "Select a valid train CSV or directory first.")
+            return
+        if not test_path or not os.path.exists(test_path):
+            messagebox.showerror("Test data missing", "Select a valid test CSV or directory first.")
             return
 
         try:
-            rows = _load_csv(train_path)
+            train_rows = _load_csv_or_dir(train_path)
+            test_rows  = _load_csv_or_dir(test_path)
         except Exception as exc:
             messagebox.showerror("CSV error", str(exc))
             return
-
-        if not rows:
-            messagebox.showerror("Empty CSV", "No data rows found.")
+        if not train_rows:
+            messagebox.showerror("Empty CSV", "No data rows found in train CSV.")
+            return
+        if not test_rows:
+            messagebox.showerror("Empty dataset", "No data rows found in test CSV(s).")
             return
 
-        # Re-detect sensors (handles manually typed path)
+        # Re-detect sensors (handles manually typed path) and resolve active slots.
         self._detect_csv_sensors(train_path)
-
-        # Compute active sensor slots: which CSV columns feed the algorithm
         active = [i for i in range(self._csv_nr_sensors)
                   if self._sensor_mask_vars[i].get()]
         if not active:
@@ -651,15 +779,15 @@ class StreamViewer(tk.Tk):
             active = active[:NR_SLOTS]
         self._active_indices = active
 
-        # Rebuild stream and histogram figures for the new sensor count
+        # Rebuild figures + cache train/test rows on the host (used for plotting,
+        # histograms, the sklearn comparison, and CSV-label ground truth).
         self._rebuild_stream_figure(len(active))
         self._rebuild_hist_figure(len(active))
-
-        # Cache training rows for comparison and histogram rendering
-        self._train_rows_cache = rows
+        self._train_rows_cache = train_rows
+        self._stream_rows      = test_rows
         self._comp_results     = None
         self._train_hist_data = [
-            np.array([float(row[col]) for row in rows], dtype=np.float64)
+            np.array([float(row[col]) for row in train_rows], dtype=np.float64)
             for col in active
         ]
         if self._page == 1:
@@ -667,34 +795,131 @@ class StreamViewer(tk.Tk):
 
         if self._mock:
             from .mock_client import MockFpgaClient
-            self._client = MockFpgaClient(nr_sensors=len(active), simulated_rx_count=len(rows))
+            self._client = MockFpgaClient(nr_sensors=len(active),
+                                          simulated_rx_count=len(train_rows))
         elif self._client is None:
             try:
-                self._client = FpgaClient(
-                    port=self._port_var.get(),
-                    baud=int(self._baud_var.get()),
-                )
+                self._client = FpgaClient(fpga_ip=self._ip_var.get().strip())
             except Exception as exc:
-                messagebox.showerror("Serial port error", str(exc))
+                messagebox.showerror("UDP socket error", str(exc))
                 return
 
+        self._data_loaded = False
         self._cancel.clear()
         self._set_state(BUSY)
+        self._lamp.set_custom("LOADING", "#4fc3f7")
         self._progress["value"] = 0
-        self._progress["mode"] = "determinate"
-        self._status_var.set(f"Sending {len(rows):,} packets…")
+        self._progress["mode"]  = "determinate"
+        total = len(train_rows) + len(test_rows)
+        self._status_var.set(f"Loading {total:,} samples to DDR2…")
+        threading.Thread(target=self._load_worker,
+                         args=(train_rows, test_rows, list(active)), daemon=True).start()
+        self.after(PROGRESS_POLL_MS, self._poll_train_queue)
+
+    def _load_worker(self, train_rows: list, test_rows: list, active: list):
+        try:
+            c = self._client
+            # OP_RESET wipes DDR2 + engine so a reload never appends to stale data.
+            c.send_reset()
+            time.sleep(0.05)
+            c.drain(0.2)
+
+            # Bulk UDP load: 16-byte rows blasted to the data port, receipt
+            # bitmap verified via LOAD_STATUS, holes resent (udp_client). The
+            # row label is pre-embedded at bit 127 so the FPGA trains on clean
+            # samples only (mock keeps the legacy per-frame path).
+            def _prep(rows):
+                vals, labels = [], []
+                for row in rows:
+                    vals.append([int(float(row[col])) if col < len(row) else 0
+                                 for col in active])
+                    labels.append(1 if (len(row) >= 1 and int(float(row[-1])) != 0) else 0)
+                return vals, labels
+
+            if self._mock:
+                total = len(train_rows) + len(test_rows)
+                done = 0
+                for opcode, rows in ((OP_LOAD_TRAIN, train_rows), (OP_LOAD_TEST, test_rows)):
+                    vals, labels = _prep(rows)
+                    for i, (v, l) in enumerate(zip(vals, labels)):
+                        if self._cancel.is_set():
+                            self._pq.put(("done", False, None, "Cancelled during load", "load"))
+                            return
+                        c.send(c.pack_frame(v, len(v), opcode, l, i))
+                        done += 1
+                        if done % PROGRESS_INTERVAL == 0:
+                            self._pq.put(("progress", done / total,
+                                          f"Loading to DDR2 {done:,}/{total:,}"))
+            else:
+                t0 = time.monotonic()
+                for region, rows, name in ((0, train_rows, "train"), (1, test_rows, "test")):
+                    if self._cancel.is_set():
+                        self._pq.put(("done", False, None, "Cancelled during load", "load"))
+                        return
+                    vals, labels = _prep(rows)
+                    base = 0.0 if region == 0 else 0.5
+                    self._pq.put(("progress", base,
+                                  f"Blasting {name} region ({len(rows):,} rows)…"))
+                    info = c.load_region(vals, region=region, labels=labels,
+                                         active_count=len(active))
+                    self._pq.put(("progress", base + 0.5,
+                                  f"{name}: {info['rows']:,} rows in {info['blocks']:,} "
+                                  f"blocks, {info['rounds']} round(s)"))
+                dt = time.monotonic() - t0
+                print(f"[load] {len(train_rows)+len(test_rows):,} rows in {dt:.2f}s "
+                      f"({16*(len(train_rows)+len(test_rows))/dt/1e6:.2f} MB/s)")
+
+            c.drain(0.2)
+            self._pq.put(("loaded",
+                          f"Staged {len(train_rows):,} train + {len(test_rows):,} test "
+                          f"samples in DDR2 — press Train."))
+        except LoadError as exc:
+            self._pq.put(("done", False, None, f"Load failed: {exc}", "load"))
+        except Exception as exc:
+            import traceback; traceback.print_exc()
+            self._pq.put(("done", False, None, f"Load failed: {exc}", "load"))
+
+    # ── Train (replay train region from DDR2: TRAIN + CALIB triggers) ──────────
+
+    def _on_train(self):
+        if not self._data_loaded:
+            messagebox.showerror("No data loaded", "Press Load Data first.")
+            return
+        if self._state not in (LOADED, READY, ERROR):
+            return
+        if self._client is None:
+            messagebox.showerror("Not connected", "Load data first.")
+            return
+
+        active = self._active_indices
+        self._comp_results = None
+        self._cancel.clear()
+        self._set_state(BUSY)
+        self._lamp.set_custom("TRAINING", _ORANGE)
+        self._progress["value"] = 0
+        self._progress["mode"]  = "determinate"
+        self._status_var.set("Training from DDR2 (replay)…")
 
         weights     = [v.get() for v in self._weight_vars]
         spike       = self._spike_var.get()
-        # sensor_mask for UART OP_CONFIG (4-slot hardware bitmask)
         sensor_mask = [j < len(active) for j in range(NR_SLOTS)]
-        # active_sensor_cols: all N active CSV column indices (no NR_SLOTS cap for mock)
         active_cols = list(active)
-        session = TrainSession(self._client, rows, self._train_progress_cb, self._cancel,
+        session = TrainSession(self._client, [], self._train_progress_cb, self._cancel,
                                weights=weights, spike_penalty=spike, sensor_mask=sensor_mask,
-                               active_sensor_cols=active_cols)
-        threading.Thread(target=self._train_worker, args=(session,), daemon=True).start()
+                               active_sensor_cols=active_cols,
+                               delta_stride=self._stride_var.get(),
+                               calib_shift=_CALIB_PCT_TO_SHIFT.get(self._calib_var.get(), 9))
+        threading.Thread(target=self._train_worker_ddr2, args=(session,), daemon=True).start()
         self.after(PROGRESS_POLL_MS, self._poll_train_queue)
+
+    def _train_worker_ddr2(self, session: TrainSession):
+        try:
+            ok, stream, msg = session.run_ddr2()
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            ok, stream, msg = False, None, f"Worker error: {exc}"
+        self._pq.put(("done", ok, stream, msg))
 
     # ── Reset / flush ──────────────────────────────────────────────────────────
 
@@ -709,10 +934,9 @@ class StreamViewer(tk.Tk):
                 self._client = MockFpgaClient(nr_sensors=max(1, len(self._active_indices)))
         elif self._client is None:
             try:
-                self._client = FpgaClient(port=self._port_var.get(),
-                                          baud=int(self._baud_var.get()))
+                self._client = FpgaClient(fpga_ip=self._ip_var.get().strip())
             except Exception as exc:
-                messagebox.showerror("Serial port error", str(exc))
+                messagebox.showerror("UDP socket error", str(exc))
                 return
 
         self._cancel.clear()
@@ -755,8 +979,15 @@ class StreamViewer(tk.Tk):
                     self._status_var.set(msg)
                 elif item[0] == "reset_done":
                     self._progress["value"] = 0
+                    self._data_loaded = False
                     self._status_var.set(item[1])
                     self._set_state(IDLE)
+                    return
+                elif item[0] == "loaded":
+                    self._data_loaded = True
+                    self._progress["value"] = 1000
+                    self._status_var.set(item[1])
+                    self._set_state(LOADED)
                     return
                 elif item[0] == "done":
                     ok, stream, msg = item[1], item[2], item[3]
@@ -801,7 +1032,9 @@ class StreamViewer(tk.Tk):
         self._status_var.set("Updating sensor config…")
 
         session = TrainSession(self._client, [], self._train_progress_cb, self._cancel,
-                               weights=weights, spike_penalty=spike, sensor_mask=sensor_mask)
+                               weights=weights, spike_penalty=spike, sensor_mask=sensor_mask,
+                               delta_stride=self._stride_var.get(),
+                               calib_shift=_CALIB_PCT_TO_SHIFT.get(self._calib_var.get(), 9))
         threading.Thread(target=self._apply_config_worker, args=(session,),
                          daemon=True).start()
         self.after(PROGRESS_POLL_MS, self._poll_train_queue)
@@ -827,19 +1060,11 @@ class StreamViewer(tk.Tk):
         if self._state != READY:
             return
 
-        test_path = self._test_var.get().strip()
-        if not test_path or not os.path.exists(test_path):
-            messagebox.showerror("Test data missing", "Select a valid test CSV or directory first.")
-            return
-
-        try:
-            self._stream_rows = _load_csv_or_dir(test_path)
-        except Exception as exc:
-            messagebox.showerror("CSV error", str(exc))
-            return
-
+        # Test data was streamed into DDR2 by Load Data; reuse those exact rows.
+        # The FPGA replays them from DDR2, so re-reading the CSV here could desync
+        # the host's plot/labels from what the hardware actually scores.
         if not self._stream_rows:
-            messagebox.showerror("Empty dataset", "No data rows found in test CSV(s).")
+            messagebox.showerror("No data loaded", "Press Load Data first.")
             return
 
         self._stream_pos    = 0
@@ -904,74 +1129,18 @@ class StreamViewer(tk.Tk):
     # paces the worker to STREAM_RATE_HZ for a watchable live view.
 
     def _stream_worker(self):
-        # Burst mode over a pipelinable transport (real UART) decouples TX from
-        # RX: blast every detect packet, then collect verdicts by position. The
-        # mock computes verdicts lock-step inside try_recv and UDP can reorder,
-        # so both stay on the paced path (PIPELINED defaults to False there).
-        pipelined = self._stream_burst and getattr(self._client, "PIPELINED", False)
-        try:
-            if pipelined:
-                self._stream_worker_pipelined()
-            else:
-                self._stream_worker_paced()
-        except Exception as exc:
-            import traceback; traceback.print_exc()
-            self._stream_q.put(("error", f"Stream error: {exc}"))
-
-    def _stream_worker_paced(self):
-        rows   = self._stream_rows
-        active = self._active_indices
-        q      = self._stream_q
-        for pos in range(len(rows)):
-            if self._cancel.is_set():
-                q.put(("done", "Stopped."))
-                return
-            row = rows[pos]
-            if len(row) < 2:
-                q.put(("error", f"row {pos} has {len(row)} columns, need ≥2"))
-                return
-            tlast = 1 if int(float(row[-1])) != 0 else 0
-            vals  = [float(row[active[j]]) if active[j] < len(row) else 0.0
-                     for j in range(len(active))]
-            t0 = time.monotonic()
-            self._client.send_sample(vals, OP_DETECT, tlast)
-
-            # Poll try_recv for the verdict: portable across real + mock,
-            # since the mock returns detect results through try_recv only.
-            byte_val = None
-            deadline = t0 + DETECT_TIMEOUT
-            while time.monotonic() < deadline:
-                if self._cancel.is_set():
-                    break
-                byte_val, _ = self._client.try_recv()
-                if byte_val is not None:
-                    break
-                time.sleep(0.0005)
-
-            if byte_val is None:
-                q.put(("timeout", pos + 1))
-                continue
-
-            is_anom  = (byte_val == 0x01)
-            csv_anom = int(float(row[-1])) != 0
-            rtt_ms   = int((time.monotonic() - t0) * 1000)
-            q.put(("sample", pos + 1, is_anom, csv_anom, vals, rtt_ms))
-
-            if not self._stream_burst:
-                elapsed = time.monotonic() - t0
-                target  = 1.0 / STREAM_RATE_HZ
-                if elapsed < target:
-                    time.sleep(target - elapsed)
-        q.put(("done", None))
-
-    def _stream_worker_pipelined(self):
+        # DDR2 detect: a single data-less OP_DETECT trigger makes the FPGA replay
+        # the staged test region, emitting a 4-byte [seq:3][verdict:1] reply per
+        # sample. Each verdict is placed by its own seq (stamped by the FPGA ==
+        # load order == row index), so a dropped/reordered reply only affects that
+        # one sample. Replies still arrive over UART, so the plot animates live.
         rows   = self._stream_rows
         active = self._active_indices
         q      = self._stream_q
         n      = len(rows)
 
-        # Pre-build per-row payloads and CSV labels once; the RX consumer
-        # indexes into these by reply position (UART preserves send order).
+        # Pre-build per-row payloads + CSV labels; the RX consumer indexes these
+        # by the seq the FPGA stamps.
         vals_list, csv_list = [], []
         for pos in range(n):
             row = rows[pos]
@@ -982,57 +1151,50 @@ class StreamViewer(tk.Tk):
             vals_list.append([float(row[active[j]]) if active[j] < len(row) else 0.0
                               for j in range(len(active))])
 
-        # Flush any stale telemetry/ack bytes so position 0 maps to the first
-        # detect verdict.
-        self._client.drain(0.1)
+        try:
+            # Flush stale telemetry/ack bytes, then fire the one detect trigger.
+            self._client.drain(0.1)
+            self._client.send(self._client.pack_frame([], len(active), OP_DETECT, 0))
 
-        # TX thread blasts every detect packet; the blocking serial write paces
-        # naturally to the UART line rate. tlast marks the final sample.
-        # Match the paced path's wire format exactly: detect ignores tlast, but
-        # it has always carried the CSV label here on the validated HW path.
-        def _tx():
-            for pos in range(n):
+            received      = 0
+            buf           = bytearray()
+            prev_t        = time.monotonic()
+            idle_deadline = None
+            while received < n:
                 if self._cancel.is_set():
+                    q.put(("done", "Stopped."))
                     return
-                tlast = 1 if csv_list[pos] else 0
-                self._client.send_sample(vals_list[pos], OP_DETECT, tlast)
-        tx_thread = threading.Thread(target=_tx, daemon=True)
-        self._tx_thread = tx_thread
-        tx_thread.start()
-
-        # RX: drain reply bytes in chunks, one verdict per detect, in order.
-        received      = 0
-        prev_t        = time.monotonic()
-        idle_deadline = None
-        while received < n:
-            if self._cancel.is_set():
-                q.put(("done", "Stopped."))
-                return
-            chunk = self._client.read_available()
-            if not chunk:
-                # Once TX is done, an extended silence means missing replies.
-                if not tx_thread.is_alive():
+                chunk = self._client.read_available()
+                if not chunk:
+                    # No bytes yet: allow for the replay + UART round-trip, then
+                    # treat extended silence as missing replies.
                     if idle_deadline is None:
                         idle_deadline = time.monotonic() + DETECT_TIMEOUT
                     elif time.monotonic() > idle_deadline:
                         q.put(("timeout", received))
                         q.put(("done", None))
                         return
-                time.sleep(0.0005)
-                continue
+                    time.sleep(0.0005)
+                    continue
 
-            idle_deadline = None
-            now    = time.monotonic()
-            rtt_ms = int((now - prev_t) * 1000)   # chunk inter-arrival proxy
-            prev_t = now
-            for b in chunk:
-                if received >= n:
-                    break   # ignore trailing/stray bytes
-                is_anom = (b == 0x01)
-                q.put(("sample", received + 1, is_anom, csv_list[received],
-                       vals_list[received], rtt_ms))
-                received += 1
-        q.put(("done", None))
+                idle_deadline = None
+                now    = time.monotonic()
+                rtt_ms = int((now - prev_t) * 1000)   # chunk inter-arrival proxy
+                prev_t = now
+                buf.extend(chunk)
+                while len(buf) >= 4 and received < n:
+                    seq = buf[0] | (buf[1] << 8) | (buf[2] << 16)
+                    verdict = buf[3]
+                    del buf[:4]
+                    if seq >= n:
+                        continue   # stray/desync guard
+                    q.put(("sample", seq + 1, verdict == 0x01, csv_list[seq],
+                           vals_list[seq], rtt_ms))
+                    received += 1
+            q.put(("done", None))
+        except Exception as exc:
+            import traceback; traceback.print_exc()
+            q.put(("error", f"Stream error: {exc}"))
 
     def _poll_stream_queue(self):
         # Refresh the burst flag on the main thread; the worker reads the bool.
@@ -1339,10 +1501,19 @@ class StreamViewer(tk.Tk):
               f"train={len(self._train_rows_cache)} test={len(self._stream_rows)}",
               file=sys.stderr, flush=True)
         try:
+            # Pass the live calib percentile so the CPU-HBOS replica thresholds
+            # at the SAME percentile as the FPGA. This re-runs on every detect,
+            # so changing the threshold (Apply Config → re-detect) re-calibrates
+            # CPU HBOS to track the live detection.
+            try:
+                calib_pct = float(self._calib_var.get())
+            except (TypeError, ValueError):
+                calib_pct = None
             results = run_comparison(
                 self._train_rows_cache,
                 self._stream_rows,
                 self._hbos_predictions,
+                calib_percentile=calib_pct,
             )
         except Exception as exc:
             import traceback
@@ -1411,22 +1582,26 @@ class StreamViewer(tk.Tk):
                      bg=_BG3, fg=_ORANGE, font=("Helvetica", 9)).pack(
                          side=tk.RIGHT, padx=12)
 
+        tk.Label(self._comp_inner,
+                 text="CPU·TUNED baselines are shown at their best-case (label-optimal) "
+                      "threshold — an upper bound; FPGA HBOS+ is the actual deployed result.",
+                 bg=bg, fg=_DIM, font=("Helvetica", 8), anchor=tk.W,
+                 justify=tk.LEFT).pack(fill=tk.X, padx=16, pady=(6, 0))
+
         ttk.Separator(self._comp_inner, orient=tk.HORIZONTAL).pack(fill=tk.X)
 
         # ── algorithm columns ─────────────────────────────────────────────────
         cards_frame = tk.Frame(self._comp_inner, bg=bg)
         cards_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=14)
-        cards_frame.columnconfigure(0, weight=1, uniform="col")
-        cards_frame.columnconfigure(1, weight=1, uniform="col")
-        cards_frame.columnconfigure(2, weight=1, uniform="col")
-        cards_frame.columnconfigure(3, weight=1, uniform="col")
-
         algo_specs = [
             ("FPGA  HBOS+",       results.get("hbos"),     "#4fc3f7", "HARDWARE"),
-            ("CPU  HBOS",         results.get("hbos_cpu"), "#a5d6a7", "CPU"),
-            ("Isolation Forest",  results.get("iforest"),  "#80deea", "CPU"),
-            ("One-Class SVM",     results.get("ocsvm"),    "#ce93d8", "CPU"),
+            ("CPU  HBOS (best F1)",             results.get("hbos_cpu"), "#a5d6a7", "CPU·TUNED"),
+            ("Isolation Forest (best F1)",      results.get("iforest"), "#80deea", "CPU·TUNED"),
+            ("One-Class SVM (tuned)",           results.get("ocsvm"),   "#ce93d8", "CPU·TUNED"),
+            ("k-NN (supervised)", results.get("knn"),      "#ffb74d", "SUPERVISED"),
         ]
+        for col in range(len(algo_specs)):
+            cards_frame.columnconfigure(col, weight=1, uniform="col")
 
         for col, (title, metrics, accent, badge) in enumerate(algo_specs):
             self._build_algo_card(cards_frame, col, title, metrics, accent, badge)
@@ -1457,6 +1632,16 @@ class StreamViewer(tk.Tk):
             tk.Label(body, text="Not available\n(scikit-learn missing)",
                      bg=bg, fg=_DIM, font=("Helvetica", 9),
                      justify=tk.CENTER).pack(pady=20)
+            return
+
+        # Degenerate result (e.g. supervised model with no anomalies to learn):
+        # a dict carrying only a "note" and no metric fields.
+        if "f1" not in metrics:
+            tk.Label(body, text="Not applicable", bg=bg, fg=_ORANGE,
+                     font=("Helvetica", 10, "bold"), justify=tk.CENTER).pack(pady=(20, 6))
+            tk.Label(body, text=metrics.get("note", ""), bg=bg, fg=_DIM,
+                     font=("Helvetica", 8), wraplength=150,
+                     justify=tk.CENTER).pack(pady=(0, 20))
             return
 
         # ── main metric bars ──────────────────────────────────────────────────
@@ -1497,7 +1682,13 @@ class StreamViewer(tk.Tk):
             ttk.Separator(body, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(8, 4))
             timing = tk.Frame(body, bg=bg)
             timing.pack(fill=tk.X)
-            for label, val in [("Fit", f"{fit_ms} ms"), ("Predict", f"{predict_ms} ms")]:
+            # predict_ms is None for the single-pass fit_predict path (iForest):
+            # show one combined row instead of a bogus "None ms".
+            if predict_ms is None:
+                rows = [("Fit+detect", f"{fit_ms} ms")]
+            else:
+                rows = [("Fit", f"{fit_ms} ms"), ("Predict", f"{predict_ms} ms")]
+            for label, val in rows:
                 row = tk.Frame(timing, bg=bg)
                 row.pack(fill=tk.X, pady=1)
                 tk.Label(row, text=label, bg=bg, fg=_DIM,
@@ -1726,7 +1917,7 @@ def main():
     args = ap.parse_args()
 
     if args.mock:
-        import licenta.gui.train_session as _ts
+        from . import train_session as _ts
         _ts.POST_CALIB_WAIT  = 0.3
         _ts.LATCH_SETTLE     = 0.2
         _ts.DUMP_CALIB_LATCH = 8

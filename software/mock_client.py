@@ -18,7 +18,8 @@ import struct
 import threading
 import time
 
-from .uart_client import OP_TRAIN, OP_CALIBRATE, OP_DETECT, OP_DUMP, OP_CONFIG, OP_RESET
+from .uart_client import (OP_TRAIN, OP_CALIBRATE, OP_DETECT, OP_DUMP, OP_CONFIG,
+                          OP_RESET, OP_LOAD_TRAIN, OP_LOAD_TEST, DEFAULT_CALIB_SHIFT)
 
 NR_BINS       = 2048
 NR_DELTA_BINS = 256
@@ -67,15 +68,19 @@ class _HbosEngine:
         self._nr_sensors    = nr_sensors
         self._weights       = [64] * nr_sensors
         self._spike_penalty = 5632
+        self._calib_shift   = DEFAULT_CALIB_SHIFT   # global-threshold percentile shift
         self._active_mask   = (1 << nr_sensors) - 1
         self._state         = self._IDLE
         self._reset_model()
 
-    def set_config(self, weights: list, spike_penalty: int):
+    def set_config(self, weights: list, spike_penalty: int,
+                   calib_shift: int = DEFAULT_CALIB_SHIFT):
         # Extend or truncate weights to match nr_sensors; pad with 64 if short
         padded = list(weights) + [64] * self._nr_sensors
         self._weights       = [int(padded[i]) & 0xFF for i in range(self._nr_sensors)]
         self._spike_penalty = int(spike_penalty) & 0xFFFF
+        # 0 = legacy host that sends no calib word -> keep the default 99.8th pct
+        self._calib_shift   = int(calib_shift) & 0x1F or DEFAULT_CALIB_SHIFT
 
     def set_mask(self, mask: int):
         self._active_mask = int(mask) & ((1 << self._nr_sensors) - 1)
@@ -176,7 +181,7 @@ class _HbosEngine:
 
     def _finalize_calib(self):
         n   = self._calib_count
-        tgt = n - (n >> 9)
+        tgt = n - (n >> self._calib_shift)
         cum = 0
         th  = 32767
         for j in range(2048):
@@ -186,6 +191,14 @@ class _HbosEngine:
                 break
         self._global_th = th
         self._state     = self._READY
+
+    def refinalize(self):
+        """Recompute the global threshold from the EXISTING score histogram with
+        the current calib_shift. Used when config (percentile/weights) changes
+        after calibration — mirrors the FPGA's OP_CONFIG -> OP_DUMP re-finalize
+        without re-accumulating samples."""
+        if self._state == self._READY and self._calib_count > 0:
+            self._finalize_calib()
 
     def on_dump(self):
         """First OP_DUMP after calibration finalizes the threshold."""
@@ -242,17 +255,27 @@ class MockFpgaClient:
         self._calib_idx      = 0    # packet counter for OP_CALIBRATE
         self._telem: list    = []   # built after finalize_calib
 
+        # Emulated DDR2 staging: train/test regions filled by OP_LOAD_*, then
+        # replayed on the OP_TRAIN/OP_CALIB/OP_DETECT triggers — mirrors dataset_dma.
+        self._ddr_train: list = []
+        self._ddr_test:  list = []
+        self._verdict_buf = bytearray()   # 4-byte [seq:3][verdict:1] detect replies
+
     # ── packet building ───────────────────────────────────────────────────────
 
-    def pack_frame(self, values: list, active_count: int, opcode: int, tlast: int) -> bytes:
+    def pack_frame(self, values: list, active_count: int, opcode: int, tlast: int,
+                   seq: int = 0) -> bytes:
         vals = list(values)
-        out = bytes((len(vals) & 0xFF, int(active_count) & 0xFF, opcode & 0x07, tlast & 1))
+        s = int(seq) & 0xFFFFFF
+        out = bytes((len(vals) & 0xFF, int(active_count) & 0xFF, opcode & 0x0F, tlast & 1,
+                     s & 0xFF, (s >> 8) & 0xFF, (s >> 16) & 0xFF))
         for v in vals:
             out += struct.pack("<i", int(float(v)))
         return out + bytes((0xA5, 0x5A))
 
     def pack_config_packet(self, weights: list, spike_penalty: int,
-                           active_count: int = None) -> bytes:
+                           active_count: int = None, delta_stride: int = 1,
+                           calib_shift: int = DEFAULT_CALIB_SHIFT) -> bytes:
         w = [int(x) & 0xFF for x in list(weights)[:16]]
         w += [0] * (16 - len(w))
         if active_count is None:
@@ -262,21 +285,27 @@ class MockFpgaClient:
             val = w[4*k] | (w[4*k+1] << 8) | (w[4*k+2] << 16) | (w[4*k+3] << 24)
             words.append(struct.unpack('<i', struct.pack('<I', val))[0])
         words.append(int(spike_penalty) & 0xFFFF)
+        words.append(int(delta_stride) & 0xF)
+        words.append(int(calib_shift) & 0x1F)
         return self.pack_frame(words, active_count, OP_CONFIG, 0)
 
     # ── send ──────────────────────────────────────────────────────────────────
 
     def send(self, payload: bytes) -> None:
         # New count-prefixed frame: [n_words][active_count][opcode][tlast][data..][magic]
-        if len(payload) < 6:
+        if len(payload) < 9:
             return
         n_words = payload[0]
-        opcode  = payload[2] & 0x07
+        opcode  = payload[2] & 0x0F
         tlast   = payload[3] & 1
-        words = [struct.unpack('<i', payload[4 + 4*i:8 + 4*i])[0] for i in range(n_words)]
+        seq     = payload[4] | (payload[5] << 8) | (payload[6] << 16)
+        words = [struct.unpack('<i', payload[7 + 4*i:11 + 4*i])[0] for i in range(n_words)]
 
         if opcode == OP_RESET:
             self._hbos.reset()
+            self._ddr_train = []
+            self._ddr_test  = []
+            self._verdict_buf = bytearray()
             self._calib_idx   = 0
             self._last_opcode = opcode
             return
@@ -289,19 +318,41 @@ class MockFpgaClient:
                 wv = words[k] & 0xFFFFFFFF
                 w16 += [(wv >> (8*b)) & 0xFF for b in range(4)]
             spike = words[4] & 0xFFFF if len(words) > 4 else 0
-            self._hbos.set_config(w16[:ns], spike)
+            calib_shift = words[6] & 0x1F if len(words) > 6 else 0
+            self._hbos.set_config(w16[:ns], spike, calib_shift)
             self._hbos.set_mask((1 << ns) - 1)
+            # If already calibrated, re-finalize the threshold at the new config
+            # (mirrors the FPGA OP_CONFIG -> OP_DUMP re-finalize used by Apply Config).
+            self._hbos.refinalize()
             self._last_opcode = opcode
             return
 
+        # ── DDR2 staging: store one sample into the train/test region ──────────
+        if opcode == OP_LOAD_TRAIN:
+            self._ddr_train.append(list(words))
+            self._last_opcode = opcode
+            return
+        if opcode == OP_LOAD_TEST:
+            self._ddr_test.append(list(words))
+            self._last_opcode = opcode
+            return
+
+        # ── replay triggers (data-less): rebuild/score from the DDR2 region ───
         if opcode == OP_TRAIN:
-            self._hbos.on_train(words, is_clean=(tlast == 0))
+            # Rebuild histograms from the staged train region (replay, all clean).
+            self._hbos.reset()
+            self._calib_idx = 0
+            for sample in self._ddr_train:
+                self._hbos.on_train(sample, is_clean=True)
             self._last_opcode = opcode
             return
 
         if opcode == OP_CALIBRATE:
-            self._hbos.on_calibrate(self._calib_idx, words, is_clean=(tlast == 0))
-            self._calib_idx += 1
+            # Score the staged train region to build the threshold distribution.
+            self._calib_idx = 0
+            for idx in range(len(self._ddr_train)):
+                self._hbos.on_calibrate(idx, self._ddr_train[idx], is_clean=True)
+                self._calib_idx += 1
             self._last_opcode = opcode
             return
 
@@ -320,17 +371,39 @@ class MockFpgaClient:
             return
 
         if opcode == OP_DETECT:
-            self._detect_pending = True
-            self._detect_data = words
+            # Replay the staged test region, stamping seq = sample index, and
+            # buffer the 4-byte [seq:3][verdict:1] replies for read_available().
+            self._hbos._det_history = None
+            buf = bytearray()
+            for i, sample in enumerate(self._ddr_test):
+                v = 0x01 if self._hbos.detect(sample) else 0x00
+                buf += bytes((i & 0xFF, (i >> 8) & 0xFF, (i >> 16) & 0xFF, v))
+            with self._lock:
+                self._verdict_buf = buf
             self._last_opcode = opcode
 
     def send_reset(self) -> None:
-        """Flush the mock engine — mirrors UartFpgaClient.send_reset / OP_RESET."""
+        """Flush the mock engine + DDR2 regions — mirrors UartFpgaClient.send_reset."""
         self._hbos.reset()
+        self._ddr_train = []
+        self._ddr_test  = []
+        with self._lock:
+            self._verdict_buf = bytearray()
         self._calib_idx   = 0
         self._last_opcode = OP_RESET
 
-    def send_sample(self, values: list, opcode: int, tlast: int) -> None:
+    def read_available(self) -> bytes:
+        """Return all buffered detect-verdict bytes (4 per sample) and clear them.
+        Mirrors UartFpgaClient.read_available so the GUI's seq-based RX consumer
+        works identically against the mock."""
+        with self._lock:
+            if self._verdict_buf:
+                b = bytes(self._verdict_buf)
+                self._verdict_buf = bytearray()
+                return b
+        return b""
+
+    def send_sample(self, values: list, opcode: int, tlast: int, seq: int = 0) -> None:
         """Send N sensor values directly to the HBOS engine, bypassing serialisation."""
         data = [int(float(v)) for v in values]
         is_clean = (tlast == 0)
@@ -348,7 +421,19 @@ class MockFpgaClient:
         elif opcode == OP_DETECT:
             self._detect_pending = True
             self._detect_data = data
+            self._detect_seq  = seq
             self._last_opcode = opcode
+
+    def recv_verdict(self, timeout: float = 1.0):
+        """Return (seq, verdict) for a pending detect sample, else None.
+        Mirrors the FPGA's 4-byte [seq:3][verdict:1] detect response."""
+        if self._last_opcode == OP_DETECT and self._detect_pending:
+            self._detect_pending = False
+            data = getattr(self, '_detect_data', [0])
+            seq  = getattr(self, '_detect_seq', 0)
+            v = 0x01 if self._hbos.detect(data) else 0x00
+            return seq, v
+        return None
 
     # ── recv ──────────────────────────────────────────────────────────────────
 

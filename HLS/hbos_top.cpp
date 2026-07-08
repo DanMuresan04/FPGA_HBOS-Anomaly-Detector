@@ -11,6 +11,8 @@ static count_t      hb_last_d_val[NR_SENSORS]   = {0, 0, 0, 0};
 static weight_t sensor_weights[NR_SENSORS] = {50, 93, 58, 55};
 static spike_t  spike_penalty = 5632;
 
+static ap_uint<5> calib_shift = 9;
+
 #include "hbos_math.h"
 void convert_hist_to_score(count_t hist[NR_SENSORS][NR_BINS], count_t train_count) {
     ap_uint<16> log2_denom = aprox_log2(train_count + 2048);
@@ -40,7 +42,7 @@ void convert_hist_to_score(count_t hist[NR_SENSORS][NR_BINS], count_t train_coun
 
 void finalize_global_threshold(count_t calib_count, total_score_t &threshold) {
 
-    count_t target = calib_count - (calib_count >> 9);
+    count_t target = calib_count - (calib_count >> calib_shift);
     count_t cumulative = 0;
     ap_uint<11> threshold_bin = 2047;
     for (int i = 0; i < 2048; i++) {
@@ -216,6 +218,7 @@ void hbos_top(hls::stream<addr_packet_t>& in_stream, count_t hist[NR_SENSORS][NR
             total_rx_train   = 0;
             total_rx_calib   = 0;
             global_threshold = 32767;
+            calib_shift      = 9;
 #ifndef __SYNTHESIS__
             printf("[OP_RESET] full state flush\n");
 #endif
@@ -227,12 +230,17 @@ void hbos_top(hls::stream<addr_packet_t>& in_stream, count_t hist[NR_SENSORS][NR
                 sensor_weights[i] = (weight_t)pkt.d_addr[i];
             }
             spike_penalty = ((spike_t)pkt.addr[1] << 11) | (spike_t)pkt.addr[0];
+
+            {
+                ap_uint<5> cs = (ap_uint<5>)pkt.addr[2];
+                calib_shift = (cs == 0) ? (ap_uint<5>)9 : cs;
+            }
             config_written = false;
 #ifndef __SYNTHESIS__
-            printf("[OP_CONFIG] weights={%d,%d,%d,%d} spike_penalty=%d\n",
+            printf("[OP_CONFIG] weights={%d,%d,%d,%d} spike_penalty=%d calib_shift=%d\n",
                    (int)sensor_weights[0], (int)sensor_weights[1],
                    (int)sensor_weights[2], (int)sensor_weights[3],
-                   (int)spike_penalty);
+                   (int)spike_penalty, (int)calib_shift);
 #endif
         }
         else if (opcode == OP_DUMP && calib_done && !config_written) {

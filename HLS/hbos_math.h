@@ -1,25 +1,12 @@
 #ifndef HBOS_MATH_H
 #define HBOS_MATH_H
 
-// ============================================================================
-// Fixed-point log helpers for HBOS binning.
-//
-// Idea: a value's "rarity" in HBOS is driven by counts on a log scale, and the
-// histogram should be dense near a sensor's centre and coarsen geometrically
-// outward. Both are served by cheap integer log approximations (no DSP/float):
-// the bin address is essentially a floating-point encoding {sign, exponent,
-// mantissa} of the distance from the centre.
-// ============================================================================
-
 #include "hbos_types.h"
 
-// 8.8 fixed-point fractional part of log2, indexed by the top 4 mantissa bits.
 static const ap_uint<10> log2_frac_lut[16] = {
     0, 22, 43, 63, 82, 101, 119, 136, 153, 170, 186, 202, 217, 232, 246, 260
 };
 
-// Approximate log2(x) in 8.8 fixed-point (integer part << 8 | fractional LUT).
-// Returns 0 for x == 0. Used to turn raw bin counts into log-rarity scores.
 static inline ap_uint<16> aprox_log2(ap_uint<32> x) {
     #pragma HLS INLINE
     if (x == 0) {
@@ -36,9 +23,6 @@ static inline ap_uint<16> aprox_log2(ap_uint<32> x) {
     return ((ap_uint<16>)msb << 8) + log2_frac_lut[frac_bits];
 }
 
-// Value-histogram bin for `v` relative to the sensor's learned `center`.
-// Encodes |v - center| as {sign, exponent(H_EXP_BITS), mantissa(H_MANT_BITS)}
-// so bins are fine near the centre and grow geometrically with distance.
 static inline bin_addr_t log_linear_addr(sensor_t v, sensor_t center) {
     #pragma HLS INLINE
     sensor_t diff;
@@ -73,9 +57,6 @@ static inline bin_addr_t log_linear_addr(sensor_t v, sensor_t center) {
     return addr;
 }
 
-// Delta-histogram bin for an unsigned magnitude `diff` (|sample - previous|).
-// Same exponent/mantissa encoding as above but unsigned (D_EXP/D_MANT bits);
-// a delta landing above the learned delta_th[] adds the spike penalty.
 static inline delta_addr_t delta_log_linear_addr(ap_uint<32> diff) {
     #pragma HLS INLINE
     if (diff == 0) {

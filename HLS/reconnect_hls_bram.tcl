@@ -10,8 +10,8 @@
 #
 # Run this AFTER the IPs are back at K=4 (hist_0..3, hbos_top dual-port A/B).
 #
-# Usage (Vivado Tcl console):
-#   source /home/dan/HLS/VivadoProjects/licenta/training_engine/reconnect_hls_bram.tcl
+# Usage (Vivado Tcl console), from the licenta checkout:
+#   source <licenta>/HLS/reconnect_hls_bram.tcl
 
 if {[catch {current_bd_design} bd] || $bd eq ""} {
     open_bd_design [lindex [get_files demo.bd] 0]

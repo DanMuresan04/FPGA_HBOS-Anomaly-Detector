@@ -3,11 +3,13 @@
 #include <string>
 #include <sstream>
 #include <cstdio>
+#include <cstdlib>
 #include "hbos_types.h"
 #include "hbos_engine.h"
+#include "tb_verdict.h"
 
 void packet_assembler(hls::stream<rx_byte_axis_t>&, hls::stream<sensor_packet_t>&);
-void address_engine(hls::stream<sensor_packet_t>&, hls::stream<addr_packet_t>&);
+void address_engine(hls::stream<sensor_packet_t>&, hls::stream<addr_ctrl_t>&, hls::stream<addr_data_t>&);
 
 static void send_byte(hls::stream<rx_byte_axis_t>& rx, ap_uint<8> b, bool last) {
     rx_byte_axis_t beat; beat.data = b; beat.keep = 1; beat.strb = 1; beat.last = last;
@@ -20,6 +22,7 @@ static void send_frame(hls::stream<rx_byte_axis_t>& rx,
     send_byte(rx, (ap_uint<8>)active,  false);
     send_byte(rx, (ap_uint<8>)opcode,  false);
     send_byte(rx, (ap_uint<8>)tlast,   false);
+    send_byte(rx, 0, false); send_byte(rx, 0, false); send_byte(rx, 0, false);
     for (int i = 0; i < n; i++) {
         long v = vals[i];
         send_byte(rx, (ap_uint<8>)(v & 0xFF),         false);
@@ -37,17 +40,24 @@ static void pipeline_one_packet(
     const long *vals, int n, int active, int opcode, int tlast
 ) {
     hls::stream<sensor_packet_t> raw_in;
-    hls::stream<addr_packet_t>   addr_out;
+    hls::stream<addr_ctrl_t>     ctrl_out;
+    hls::stream<addr_data_t>     data_out;
+    static hls::stream<verdict_beat_t> vout;
     send_frame(rx_byte_stream, vals, n, active, opcode, tlast);
     packet_assembler(rx_byte_stream, raw_in);
-    address_engine(raw_in, addr_out);
-    hbos_engine(addr_out, anomaly_out);
+    address_engine(raw_in, ctrl_out, data_out);
+    hbos_engine(ctrl_out, data_out, vout);
+    tb_unpack_verdicts(vout, anomaly_out);
 }
 
 int main() {
-    std::ifstream file("hls_test_stream.csv");
+
+    const char* root_env = std::getenv("LICENTA_ROOT");
+    std::string csv_path = (root_env ? std::string(root_env) : std::string(".."))
+                          + "/training_engine/hls_test_stream.csv";
+    std::ifstream file(csv_path);
     if (!file.is_open()) {
-        std::cerr << "Error: Could not open hls_test_stream.csv" << std::endl;
+        std::cerr << "Error: Could not open " << csv_path << std::endl;
         return 1;
     }
 

@@ -14,13 +14,22 @@ void packet_assembler(
     ap_uint<8> h_opcode = rx_in.read().data;
     ap_uint<8> h_tlast  = rx_in.read().data;
 
+    ap_uint<8> h_seq0   = rx_in.read().data;
+    ap_uint<8> h_seq1   = rx_in.read().data;
+    ap_uint<8> h_seq2   = rx_in.read().data;
+
     int n_words = (int)h_nwords;
-    if (n_words > NR_SENSORS) n_words = NR_SENSORS;
+    if (n_words > PKT_WORDS) n_words = PKT_WORDS;
 
     sensor_packet_t pkt;
-    pkt.opcode       = (opcode_t)(h_opcode & 0x07);
+
+    #pragma HLS ARRAY_PARTITION variable=pkt.data complete dim=1
+    pkt.opcode       = (opcode_t)(h_opcode & 0x0F);
     pkt.tlast        = (bool)(h_tlast & 0x01);
     pkt.active_count = (ap_uint<5>)h_active;
+    pkt.seq          = ((ap_uint<24>)h_seq2 << 16) |
+                       ((ap_uint<24>)h_seq1 << 8)  |
+                        (ap_uint<24>)h_seq0;
     pkt.reserve      = 0;
 
     for (int i = 0; i < n_words; i++) {
@@ -33,7 +42,7 @@ void packet_assembler(
         pkt.data[i] = ((sensor_t)b3 << 24) | ((sensor_t)b2 << 16) |
                       ((sensor_t)b1 << 8)  |  (sensor_t)b0;
     }
-    for (int i = 0; i < NR_SENSORS; i++) {
+    for (int i = 0; i < PKT_WORDS; i++) {
         #pragma HLS UNROLL
         if (i >= n_words) pkt.data[i] = 0;
     }

@@ -675,7 +675,7 @@ def test_stream_viewer_vars_initialised_before_build_ui():
 
             # Manually replicate enough of __init__ to hit the ordering invariant
             app._port_var = tk.StringVar(value="sentinel")
-            app._baud_var = tk.StringVar(value="1000000")
+            app._baud_var = tk.StringVar(value="4000000")
             # If the ordering were wrong, accessing _port_var here would raise
             assert app._port_var.get() == "sentinel"
         finally:

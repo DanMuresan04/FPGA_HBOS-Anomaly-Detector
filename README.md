@@ -8,9 +8,11 @@ are not tracked.
 ## Layout
 
 - **`HLS/`** — Vitis HLS C++ sources for the detection pipeline
-  (`address_engine`, `detection_engine`, `packet_assembler`, `hbos_top`),
-  their headers, testbenches, and build/sim config (`hls_config.cfg`,
-  `run_csim.sh`, `run_sim.tcl`, `sim.py`, `vitis-comp.json`).
+  (`packet_assembler`, `address_engine`, `hbos_engine` — the merged
+  train/calibrate/detect core — plus the earlier split `detection_engine`/
+  `hbos_top`), their headers, testbenches, and build/sim tooling
+  (`run_pkg.sh`, `run_csim.sh`, `run_sim.tcl`, `sim.py`, `hls_config.cfg`,
+  `vitis-comp.json`, `build_demo_bd.tcl`, `reconnect_hls_bram.tcl`).
 - **`VHDL/`** — hand-written RTL (`bram_addr_shift`, `bram_quad_mux_infer`).
 - **`software/`** — Python host tooling: the live stream viewer GUI
   (`stream_viewer.py`), transports (`uart_client.py`, `fpga_client.py`,

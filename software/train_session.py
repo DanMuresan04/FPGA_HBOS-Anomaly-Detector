@@ -17,7 +17,8 @@ import time
 import threading
 from typing import Callable
 
-from .uart_client import UartFpgaClient as FpgaClient, OP_TRAIN, OP_CALIBRATE, OP_DUMP, OP_CONFIG, OP_RESET
+from .udp_client import (UdpFpgaClient as FpgaClient, OP_TRAIN, OP_CALIBRATE,
+                         OP_DUMP, OP_CONFIG, OP_RESET, DEFAULT_CALIB_SHIFT)
 
 TRAIN_PACE       = 0.0002   # seconds between send()s during train/calib
 POST_CALIB_WAIT  = 5.0      # seconds to wait after last CALIB before latch
@@ -50,6 +51,8 @@ class TrainSession:
         spike_penalty: "int | None" = None,
         sensor_mask: "list | None" = None,
         active_sensor_cols: "list | None" = None,
+        delta_stride: int = 1,
+        calib_shift: int = DEFAULT_CALIB_SHIFT,
     ):
         self._c = client
         self._rows = rows
@@ -59,6 +62,8 @@ class TrainSession:
         self._spike_penalty = spike_penalty if spike_penalty is not None else 5632
         self._sensor_mask = sensor_mask        # list of bools; None = all enabled
         self._active_cols = active_sensor_cols  # CSV col index per active channel (len=N)
+        self._delta_stride = delta_stride       # detect-time delta stride (1..8)
+        self._calib_shift = calib_shift          # global-threshold percentile shift
 
     def _ac(self) -> int:
         """Active sensor count (= number of live channels)."""
@@ -97,7 +102,8 @@ class TrainSession:
         if self._weights is not None:
             self._cb(0.00, "Sending OP_CONFIG…")
             self._c.send(self._c.pack_config_packet(
-                self._active_weights(), self._spike_penalty, self._ac()))
+                self._active_weights(), self._spike_penalty, self._ac(),
+                delta_stride=self._delta_stride, calib_shift=self._calib_shift))
             time.sleep(0.05)
 
         # ── 1. TRAIN ────────────────────────────────────────────────────────
@@ -215,21 +221,26 @@ class TrainSession:
         c = self._c
 
         self._cb(0.05, "Sending OP_CONFIG…")
-        c.send(c.pack_config_packet(self._active_weights(), self._spike_penalty, self._ac()))
+        c.send(c.pack_config_packet(self._active_weights(), self._spike_penalty, self._ac(),
+                                    delta_stride=self._delta_stride, calib_shift=self._calib_shift))
         time.sleep(0.05)
 
-        self._cb(0.20, f"Config latch: 1× DUMP + {DUMP_CALIB_LATCH}× CALIB…")
+        # A single OP_DUMP re-finalizes the threshold over the EXISTING (clean)
+        # score histogram with the just-applied config, and writes it to
+        # detection_engine via the config stream. We deliberately do NOT pump
+        # OP_CALIBRATE here: in the DDR2 design each OP_CALIB replays the whole
+        # train region back into score_hist (which is never re-zeroed after the
+        # first calibration), so repeated config-updates pile the distribution
+        # up and collapse the threshold until OP_RESET. The percentile/weights
+        # only change the cutoff, not the stored histogram, so re-finalize alone
+        # is both correct and idempotent.
+        self._cb(0.40, "Re-finalizing threshold (OP_DUMP)…")
         c.send(c.pack_frame([], self._ac(), OP_DUMP, 0))
         time.sleep(0.1)
-        for _ in range(DUMP_CALIB_LATCH):
-            if self._cancel.is_set():
-                return False, None, "Cancelled during config latch"
-            c.send(c.pack_frame([], self._ac(), OP_CALIBRATE, 0))
-            time.sleep(0.02)
 
-        self._cb(0.70, f"Latch settle ({LATCH_SETTLE:.0f}s)…")
+        self._cb(0.70, f"Settle ({LATCH_SETTLE:.0f}s)…")
         if not self._wait(LATCH_SETTLE):
-            return False, None, "Cancelled during latch settle"
+            return False, None, "Cancelled during settle"
         c.drain(0.3)
 
         self._cb(0.90, "Telemetry poll…")
@@ -239,6 +250,50 @@ class TrainSession:
             return False, stream, f"Config update failed — telemetry incomplete: {partial}"
 
         self._cb(1.00, "Config applied!")
+        return True, stream, "OK"
+
+    # ── DDR2 trigger-based training ───────────────────────────────────────────
+
+    def run_ddr2(self) -> tuple:
+        """DDR2 path: the dataset is already staged in DDR2 (the Load step did the
+        OP_RESET + OP_LOAD_*). Here we just CONFIG, then fire data-less OP_TRAIN
+        and OP_CALIB triggers — the engine replays the train region from DDR2 at
+        engine clock — and finalize the threshold via OP_DUMP telemetry.
+
+        Crucially we do NOT send OP_RESET here: that would wipe the staged DDR2.
+        Each trigger is a single data-less frame; dataset_dma replays the whole
+        region, and the in-order AXIS pipeline guarantees TRAIN completes before
+        CALIB and CALIB before DUMP, so no inter-trigger host wait is needed.
+
+        Returns (ok, telemetry_stream, message).
+        """
+        # ── CONFIG (weights + spike) ─────────────────────────────────────────
+        if self._weights is not None:
+            self._cb(0.05, "Sending OP_CONFIG…")
+            self._c.send(self._c.pack_config_packet(
+                self._active_weights(), self._spike_penalty, self._ac(),
+                delta_stride=self._delta_stride, calib_shift=self._calib_shift))
+            time.sleep(0.05)
+
+        # ── TRAIN trigger: replay the DDR2 train region → build histograms ────
+        self._cb(0.25, "TRAIN trigger — replaying train region from DDR2…")
+        self._c.send(self._c.pack_frame([], self._ac(), OP_TRAIN, 0))
+        time.sleep(0.05)
+
+        # ── CALIB trigger: replay again → build the threshold distribution ────
+        self._cb(0.55, "CALIB trigger — replaying train region from DDR2…")
+        self._c.send(self._c.pack_frame([], self._ac(), OP_CALIBRATE, 0))
+        time.sleep(0.05)
+        self._c.drain(0.3)
+
+        # ── finalize + telemetry (OP_DUMP) ───────────────────────────────────
+        self._cb(0.85, f"Finalize + telemetry poll (up to {TELEMETRY_POLLS} OP_DUMP)…")
+        ok, stream = self._collect_telemetry()
+        if not ok:
+            partial = " ".join(f"{b:02x}" for b in stream) if stream else "(empty)"
+            return False, stream, f"Telemetry incomplete after DDR2 replay: {partial}"
+
+        self._cb(1.00, "Ready!")
         return True, stream, "OK"
 
     # ── telemetry parsing (static helper for GUI) ────────────────────────────
